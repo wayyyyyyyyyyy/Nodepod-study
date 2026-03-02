@@ -1,0 +1,231 @@
+// VFSBridge — syncs the canonical MemoryVolume with worker VFS clones.
+// Creates snapshots for initialization, applies worker writes, broadcasts changes.
+
+import type { MemoryVolume } from "../memory-volume";
+import type { VFSBinarySnapshot, VFSSnapshotEntry } from "./worker-protocol";
+import type { SharedVFSController } from "./shared-vfs";
+
+/* ------------------------------------------------------------------ */
+/*  Constants                                                          */
+/* ------------------------------------------------------------------ */
+
+const VFS_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
+
+/* ------------------------------------------------------------------ */
+/*  VFSBridge                                                          */
+/* ------------------------------------------------------------------ */
+
+export class VFSBridge {
+  private _volume: MemoryVolume;
+  private _broadcaster: ((path: string, content: ArrayBuffer | null, excludePid: number) => void) | null = null;
+  private _sharedVFS: SharedVFSController | null = null;
+  // Suppressed during handleWorkerWrite/Mkdir/Delete to prevent double-broadcasting
+  private _suppressWatch = false;
+
+  constructor(volume: MemoryVolume) {
+    this._volume = volume;
+  }
+
+  setBroadcaster(fn: (path: string, content: ArrayBuffer | null, excludePid: number) => void): void {
+    this._broadcaster = fn;
+  }
+
+  setSharedVFS(controller: SharedVFSController): void {
+    this._sharedVFS = controller;
+  }
+
+  // Packs all files into a single ArrayBuffer with a manifest
+  createSnapshot(): VFSBinarySnapshot {
+    const manifest: VFSSnapshotEntry[] = [];
+    const chunks: Uint8Array[] = [];
+    let totalSize = 0;
+
+    this._walkVolume("/", (path, isDirectory, content) => {
+      if (isDirectory) {
+        manifest.push({
+          path,
+          offset: 0,
+          length: 0,
+          isDirectory: true,
+        });
+      } else if (content) {
+        manifest.push({
+          path,
+          offset: totalSize,
+          length: content.byteLength,
+          isDirectory: false,
+        });
+        chunks.push(content);
+        totalSize += content.byteLength;
+      }
+    });
+
+    const data = new ArrayBuffer(totalSize);
+    const view = new Uint8Array(data);
+    let offset = 0;
+    for (const chunk of chunks) {
+      view.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    return { manifest, data };
+  }
+
+  // Split into chunks for large transfers
+  createChunkedSnapshots(): { chunkIndex: number; totalChunks: number; data: ArrayBuffer; manifest: VFSSnapshotEntry[] }[] {
+    const fullSnapshot = this.createSnapshot();
+    const totalSize = fullSnapshot.data.byteLength;
+
+    if (totalSize <= VFS_CHUNK_SIZE) {
+      return [{
+        chunkIndex: 0,
+        totalChunks: 1,
+        data: fullSnapshot.data,
+        manifest: fullSnapshot.manifest,
+      }];
+    }
+
+    const chunks: { chunkIndex: number; totalChunks: number; data: ArrayBuffer; manifest: VFSSnapshotEntry[] }[] = [];
+    const fullData = new Uint8Array(fullSnapshot.data);
+    const totalChunks = Math.ceil(totalSize / VFS_CHUNK_SIZE);
+
+    let currentOffset = 0;
+    for (let i = 0; i < totalChunks; i++) {
+      const chunkEnd = Math.min(currentOffset + VFS_CHUNK_SIZE, totalSize);
+      const chunkData = fullData.slice(currentOffset, chunkEnd);
+
+      const chunkManifest = fullSnapshot.manifest.filter(entry => {
+        if (entry.isDirectory) return i === 0;
+        return entry.offset >= currentOffset && entry.offset < chunkEnd;
+      }).map(entry => ({
+        ...entry,
+        offset: entry.isDirectory ? 0 : entry.offset - currentOffset,
+      }));
+
+      chunks.push({
+        chunkIndex: i,
+        totalChunks,
+        data: chunkData.buffer.slice(chunkData.byteOffset, chunkData.byteOffset + chunkData.byteLength),
+        manifest: chunkManifest,
+      });
+
+      currentOffset = chunkEnd;
+    }
+
+    return chunks;
+  }
+
+  handleWorkerWrite(path: string, content: Uint8Array): void {
+    this._suppressWatch = true;
+    try {
+      const parentDir = path.substring(0, path.lastIndexOf("/")) || "/";
+      if (parentDir !== "/" && !this._volume.existsSync(parentDir)) {
+        this._volume.mkdirSync(parentDir, { recursive: true });
+      }
+      this._volume.writeFileSync(path, content);
+      if (this._sharedVFS) {
+        this._sharedVFS.writeFile(path, content);
+      }
+    } finally {
+      this._suppressWatch = false;
+    }
+  }
+
+  handleWorkerMkdir(path: string): void {
+    this._suppressWatch = true;
+    try {
+      if (!this._volume.existsSync(path)) {
+        this._volume.mkdirSync(path, { recursive: true });
+      }
+      if (this._sharedVFS) {
+        this._sharedVFS.writeDirectory(path);
+      }
+    } finally {
+      this._suppressWatch = false;
+    }
+  }
+
+  handleWorkerDelete(path: string): void {
+    this._suppressWatch = true;
+    try {
+      try {
+        if (this._volume.existsSync(path)) {
+          const stat = this._volume.statSync(path);
+          if (stat.isDirectory()) {
+            this._volume.rmdirSync(path);
+          } else {
+            this._volume.unlinkSync(path);
+          }
+        }
+      } catch (e) {
+        console.warn(`[VFSBridge] Failed to delete "${path}":`, e);
+      }
+      if (this._sharedVFS) {
+        this._sharedVFS.deleteFile(path);
+      }
+    } finally {
+      this._suppressWatch = false;
+    }
+  }
+
+  broadcastChange(path: string, content: ArrayBuffer | null, excludePid: number): void {
+    if (this._broadcaster) {
+      this._broadcaster(path, content, excludePid);
+    }
+  }
+
+  // Watches canonical volume for changes and pushes to workers. Returns unsubscribe fn.
+  watch(): () => void {
+    const handle = this._volume.watch("/", { recursive: true }, (event, filename) => {
+      if (!filename || this._suppressWatch) return;
+
+      try {
+        if (this._volume.existsSync(filename)) {
+          const stat = this._volume.statSync(filename);
+          if (stat.isDirectory()) {
+            this.broadcastChange(filename, new ArrayBuffer(0), -1);
+            if (this._sharedVFS) this._sharedVFS.writeDirectory(filename);
+          } else {
+            const data = this._volume.readFileSync(filename);
+            const buffer = (data.buffer as ArrayBuffer).slice(data.byteOffset, data.byteOffset + data.byteLength);
+            this.broadcastChange(filename, buffer, -1);
+            if (this._sharedVFS) this._sharedVFS.writeFile(filename, data);
+          }
+        } else {
+          this.broadcastChange(filename, null, -1);
+          if (this._sharedVFS) this._sharedVFS.deleteFile(filename);
+        }
+      } catch (e) {
+        console.warn(`[VFSBridge] Watch error for "${filename}":`, e);
+      }
+    });
+
+    return () => handle.close();
+  }
+
+  private _walkVolume(
+    dir: string,
+    visitor: (path: string, isDirectory: boolean, content: Uint8Array | null) => void,
+  ): void {
+    try {
+      const entries = this._volume.readdirSync(dir);
+      for (const name of entries) {
+        const fullPath = dir === "/" ? `/${name}` : `${dir}/${name}`;
+        try {
+          const stat = this._volume.statSync(fullPath);
+          if (stat.isDirectory()) {
+            visitor(fullPath, true, null);
+            this._walkVolume(fullPath, visitor);
+          } else {
+            const content = this._volume.readFileSync(fullPath);
+            visitor(fullPath, false, content);
+          }
+        } catch (e) {
+          console.warn(`[VFSBridge] Failed to stat/read "${fullPath}":`, e);
+        }
+      }
+    } catch (e) {
+      console.warn(`[VFSBridge] Failed to read directory "${dir}":`, e);
+    }
+  }
+}

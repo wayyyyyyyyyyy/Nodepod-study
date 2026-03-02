@@ -1,0 +1,372 @@
+// Inline Worker Factory — creates offload workers from embedded source.
+// Worker source is inlined as a string and spawned via Blob URL, so it works
+// in any environment (no separate file to serve). Implements Comlink's wire
+// protocol directly so the message listener is synchronous on boot — no race
+// with the first init() call. Heavy deps (esbuild, pako) load from CDN lazily.
+
+import { CDN_ESBUILD_ESM, CDN_ESBUILD_BINARY } from "../constants/cdn-urls";
+import { CDN_PAKO } from "../constants/config";
+
+const WORKER_SOURCE = /* js */ `
+"use strict";
+
+// CDN URLs (injected at build time)
+
+const ESBUILD_ESM_URL = "${CDN_ESBUILD_ESM}";
+const ESBUILD_WASM_URL = "${CDN_ESBUILD_BINARY}";
+const PAKO_URL = "${CDN_PAKO}";
+
+const cdnImport = new Function("url", "return import(url)");
+
+let esbuildEngine = null;
+let pakoModule = null;
+let _initialized = false;
+
+// Minimal Comlink-compatible expose() — implements the wire protocol
+// that comlink.wrap() speaks on the main thread.
+
+function miniExpose(obj) {
+  self.addEventListener("message", function handler(ev) {
+    if (!ev || !ev.data || !ev.data.id) return;
+    const { id, type, path } = { path: [], ...ev.data };
+
+    const args = (ev.data.argumentList || []).map(function(a) {
+      return (a && a.type === "RAW") ? a.value : a;
+    });
+
+    let returnValue;
+    try {
+      const parent = path.length > 1
+        ? path.slice(0, -1).reduce(function(o, p) { return o[p]; }, obj)
+        : obj;
+      const target = path.reduce(function(o, p) { return o[p]; }, obj);
+
+      switch (type) {
+        case "GET":
+          returnValue = target;
+          break;
+        case "SET":
+          parent[path[path.length - 1]] = (ev.data.value && ev.data.value.type === "RAW")
+            ? ev.data.value.value
+            : ev.data.value;
+          returnValue = true;
+          break;
+        case "APPLY":
+          returnValue = target.apply(parent, args);
+          break;
+        case "CONSTRUCT":
+          returnValue = new target(...args);
+          break;
+        case "RELEASE":
+          returnValue = undefined;
+          break;
+        default:
+          return;
+      }
+    } catch (err) {
+      self.postMessage({
+        id: id,
+        type: "HANDLER",
+        name: "throw",
+        value: {
+          isError: true,
+          value: { message: (err && err.message) || String(err), name: (err && err.name) || "Error", stack: (err && err.stack) || "" }
+        }
+      });
+      return;
+    }
+
+    Promise.resolve(returnValue)
+      .then(function(result) {
+        self.postMessage({ id: id, type: "RAW", value: result });
+      })
+      .catch(function(err) {
+        self.postMessage({
+          id: id,
+          type: "HANDLER",
+          name: "throw",
+          value: {
+            isError: true,
+            value: { message: (err && err.message) || String(err), name: (err && err.name) || "Error", stack: (err && err.stack) || "" }
+          }
+        });
+      });
+  });
+}
+
+// --- Base64 helper ---
+
+const SEGMENT_SIZE = 8192;
+
+function uint8ToBase64(data) {
+  const segments = [];
+  for (let offset = 0; offset < data.length; offset += SEGMENT_SIZE) {
+    segments.push(
+      String.fromCharCode.apply(
+        null,
+        Array.from(data.subarray(offset, offset + SEGMENT_SIZE))
+      )
+    );
+  }
+  return btoa(segments.join(""));
+}
+
+// --- Tar parser ---
+
+function readNullTerminated(buf, start, len) {
+  const slice = buf.slice(start, start + len);
+  const zeroPos = slice.indexOf(0);
+  const trimmed = zeroPos >= 0 ? slice.slice(0, zeroPos) : slice;
+  return new TextDecoder().decode(trimmed);
+}
+
+function readOctalField(buf, start, len) {
+  const raw = readNullTerminated(buf, start, len).trim();
+  return parseInt(raw, 8) || 0;
+}
+
+function classifyTypeFlag(flag) {
+  switch (flag) {
+    case "0": case "\\0": case "": return "file";
+    case "5": return "directory";
+    case "1": case "2": return "link";
+    default: return "other";
+  }
+}
+
+function* parseTar(raw) {
+  const BLOCK = 512;
+  let cursor = 0;
+  while (cursor + BLOCK <= raw.length) {
+    const header = raw.slice(cursor, cursor + BLOCK);
+    cursor += BLOCK;
+    if (header.every(function(b) { return b === 0; })) break;
+    const nameField = readNullTerminated(header, 0, 100);
+    if (!nameField) continue;
+    const byteSize = readOctalField(header, 124, 12);
+    const typeChar = String.fromCharCode(header[156]);
+    const prefixField = readNullTerminated(header, 345, 155);
+    const filepath = prefixField ? prefixField + "/" + nameField : nameField;
+    const kind = classifyTypeFlag(typeChar);
+    let payload;
+    if (kind === "file") {
+      payload = byteSize > 0 ? raw.slice(cursor, cursor + byteSize) : new Uint8Array(0);
+      if (byteSize > 0) cursor += Math.ceil(byteSize / BLOCK) * BLOCK;
+    }
+    yield { filepath: filepath, kind: kind, byteSize: byteSize, payload: payload };
+  }
+}
+
+// --- JSX detection ---
+
+function detectJsx(source) {
+  if (/<[A-Z][a-zA-Z0-9.]*[\\s/>]/.test(source)) return true;
+  if (/<\\/[a-zA-Z]/.test(source)) return true;
+  if (/\\/>/.test(source)) return true;
+  if (/<>|<\\/>/.test(source)) return true;
+  if (/React\\.createElement\\b/.test(source)) return true;
+  if (/jsx\\(|jsxs\\(|jsxDEV\\(/.test(source)) return true;
+  return false;
+}
+
+// --- Default define map ---
+
+const DEFAULT_DEFINE = {
+  "import.meta.url": "import_meta.url",
+  "import.meta.dirname": "import_meta.dirname",
+  "import.meta.filename": "import_meta.filename",
+  "import.meta": "import_meta",
+};
+
+// --- Worker endpoint ---
+
+const endpoint = {
+  async init() {
+    if (_initialized) return;
+
+    const pakoMod = await cdnImport(PAKO_URL);
+    pakoModule = pakoMod.default || pakoMod;
+
+    const esbuildMod = await cdnImport(ESBUILD_ESM_URL);
+    esbuildEngine = esbuildMod.default || esbuildMod;
+
+    try {
+      await esbuildEngine.initialize({ wasmURL: ESBUILD_WASM_URL });
+    } catch (err) {
+      if (!(err instanceof Error && err.message.includes('Cannot call "initialize" more than once'))) {
+        throw err;
+      }
+    }
+
+    _initialized = true;
+  },
+
+  async transform(task) {
+    if (!esbuildEngine) throw new Error("Worker not initialized");
+
+    const opts = task.options || {};
+    let loader = opts.loader || "js";
+    const format = opts.format || "cjs";
+    const define = opts.define || DEFAULT_DEFINE;
+
+    if (loader === "js" && detectJsx(task.source)) loader = "jsx";
+
+    const transformOpts = {
+      loader: loader,
+      format: format,
+      target: opts.target || "esnext",
+      platform: opts.platform || "neutral",
+      define: define,
+    };
+
+    try {
+      const output = await esbuildEngine.transform(task.source, transformOpts);
+      return {
+        type: "transform",
+        id: task.id,
+        code: output.code,
+        warnings: (output.warnings || []).map(function(w) { return w.text || String(w); }),
+      };
+    } catch (err) {
+      const fallbacks = loader === "js" ? ["jsx", "tsx", "ts"] : loader === "jsx" ? ["tsx"] : [];
+      for (let i = 0; i < fallbacks.length; i++) {
+        try {
+          const output = await esbuildEngine.transform(task.source, Object.assign({}, transformOpts, { loader: fallbacks[i] }));
+          return { type: "transform", id: task.id, code: output.code, warnings: [] };
+        } catch (e) { /* try next */ }
+      }
+      if (err && err.message && err.message.includes("Top-level await")) {
+        try {
+          const output = await esbuildEngine.transform(task.source, Object.assign({}, transformOpts, { format: "esm" }));
+          return { type: "transform", id: task.id, code: output.code, warnings: [] };
+        } catch (e) { /* fall through */ }
+      }
+      return { type: "transform", id: task.id, code: task.source, warnings: [(err && err.message) || "transform failed"] };
+    }
+  },
+
+  async extract(task) {
+    if (!pakoModule) throw new Error("Worker not initialized");
+
+    const response = await fetch(task.tarballUrl);
+    if (!response.ok) {
+      throw new Error("Archive download failed (HTTP " + response.status + "): " + task.tarballUrl);
+    }
+
+    const compressed = new Uint8Array(await response.arrayBuffer());
+    const tarBytes = pakoModule.inflate(compressed);
+
+    const files = [];
+    for (const entry of parseTar(tarBytes)) {
+      if (entry.kind !== "file" && entry.kind !== "directory") continue;
+      let relative = entry.filepath;
+      if (task.stripComponents > 0) {
+        const segments = relative.split("/").filter(Boolean);
+        if (segments.length <= task.stripComponents) continue;
+        relative = segments.slice(task.stripComponents).join("/");
+      }
+      if (entry.kind === "file" && entry.payload) {
+        let data;
+        let isBinary = false;
+        try {
+          data = new TextDecoder("utf-8", { fatal: true }).decode(entry.payload);
+        } catch (e) {
+          data = uint8ToBase64(entry.payload);
+          isBinary = true;
+        }
+        files.push({ path: relative, data: data, isBinary: isBinary });
+      }
+    }
+
+    return { type: "extract", id: task.id, files: files };
+  },
+
+  async build(task) {
+    if (!esbuildEngine) throw new Error("Worker not initialized");
+
+    const fileMap = new Map();
+    const entries = Object.entries(task.files);
+    for (let i = 0; i < entries.length; i++) {
+      fileMap.set(entries[i][0], entries[i][1]);
+    }
+
+    const volumePlugin = {
+      name: "offload-volume",
+      setup: function(build) {
+        build.onLoad({ filter: /.*/ }, function(args) {
+          const content = fileMap.get(args.path);
+          if (content === undefined) return null;
+          const ext = args.path.substring(args.path.lastIndexOf("."));
+          const loaderMap = { ".ts": "ts", ".tsx": "tsx", ".js": "js", ".mjs": "js", ".cjs": "js", ".jsx": "jsx", ".json": "json", ".css": "css" };
+          return { contents: content, loader: loaderMap[ext] || undefined };
+        });
+      },
+    };
+
+    try {
+      const result = await esbuildEngine.build({
+        entryPoints: task.entryPoints,
+        stdin: task.stdin,
+        bundle: task.bundle !== false,
+        format: task.format || "esm",
+        platform: task.platform || "browser",
+        target: task.target || "esnext",
+        minify: !!task.minify,
+        external: task.external,
+        write: false,
+        plugins: [volumePlugin],
+        absWorkingDir: task.absWorkingDir || "/",
+      });
+
+      return {
+        type: "build",
+        id: task.id,
+        outputFiles: (result.outputFiles || []).map(function(f) {
+          return { path: f.path, text: f.text || new TextDecoder().decode(f.contents) };
+        }),
+        errors: (result.errors || []).map(function(e) { return e.text || String(e); }),
+        warnings: (result.warnings || []).map(function(w) { return w.text || String(w); }),
+      };
+    } catch (err) {
+      return {
+        type: "build",
+        id: task.id,
+        outputFiles: [],
+        errors: [(err && err.message) || "build failed"],
+        warnings: [],
+      };
+    }
+  },
+
+  ping: function() {
+    return true;
+  },
+};
+
+miniExpose(endpoint);
+`;
+
+// --- Factory ---
+
+let cachedBlobUrl: string | null = null;
+
+// Creates a Worker from the inline source. Blob URL is cached and reused.
+export function createInlineWorker(): Worker | null {
+  try {
+    if (!cachedBlobUrl) {
+      const blob = new Blob([WORKER_SOURCE], { type: "application/javascript" });
+      cachedBlobUrl = URL.createObjectURL(blob);
+    }
+    return new Worker(cachedBlobUrl);
+  } catch {
+    return null;
+  }
+}
+
+// Clean up the cached blob URL when the pool is permanently disposed.
+export function revokeInlineWorkerUrl(): void {
+  if (cachedBlobUrl) {
+    URL.revokeObjectURL(cachedBlobUrl);
+    cachedBlobUrl = null;
+  }
+}

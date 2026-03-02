@@ -1,0 +1,854 @@
+// Per-process Web Worker entry point.
+// Each worker gets its own MemoryVolume, ScriptEngine, and NodepodShell.
+// I/O flows via postMessage using the protocol in worker-protocol.ts.
+
+import { MemoryVolume } from "../memory-volume";
+import { ScriptEngine, setChildProcessPolyfill } from "../script-engine";
+import { SyncChannelWorker } from "./sync-channel";
+import type {
+  MainToWorkerMessage,
+  MainToWorker_Init,
+  MainToWorker_Exec,
+  WorkerToMainMessage,
+} from "./worker-protocol";
+
+// --- Worker state ---
+
+let _pid = 0;
+let _cwd = "/";
+let _env: Record<string, string> = {};
+let _volume: MemoryVolume | null = null;
+let _initialized = false;
+let _abortController: AbortController | null = null;
+
+// Prevents echo loops: suppress vfs-write/delete while applying inbound vfs-sync
+let _suppressVFSWatch = false;
+
+let _shellInitialized = false;
+let _shellMod: typeof import("../polyfills/child_process") | null = null;
+let _syncChannelWorker: SyncChannelWorker | null = null;
+let _ipcMessageHandler: ((data: unknown) => void) | null = null;
+let _cols = 80;
+let _rows = 24;
+
+const _spawnCallbacks = new Map<number, (result: any) => void>();
+const _childOutputCallbacks = new Map<number, (stream: string, data: string) => void>();
+const _childExitCallbacks = new Map<number, (exitCode: number, stdout: string, stderr: string) => void>();
+const _ipcCallbacks = new Map<number, (data: unknown) => void>();
+let _nextRequestId = 1;
+
+// --- Post to main thread ---
+
+function post(msg: WorkerToMainMessage, transfer?: Transferable[]): void {
+  (self as unknown as Worker).postMessage(msg, transfer ?? []);
+}
+
+function postStdout(data: string): void {
+  post({ type: "stdout", data });
+}
+
+function postStderr(data: string): void {
+  post({ type: "stderr", data });
+}
+
+function postExit(exitCode: number, stdout: string, stderr: string): void {
+  post({ type: "exit", exitCode, stdout, stderr });
+}
+
+function postError(message: string, stack?: string): void {
+  post({ type: "error", message, stack });
+}
+
+function postCwdChange(cwd: string): void {
+  post({ type: "cwd-change", cwd });
+}
+
+function postStdinRawStatus(isRaw: boolean): void {
+  post({ type: "stdin-raw-status", isRaw });
+}
+
+// --- Message handler ---
+
+self.addEventListener("message", (ev: MessageEvent) => {
+  if (!ev?.data?.type) return;
+  const msg = ev.data as MainToWorkerMessage;
+
+  switch (msg.type) {
+    case "init":
+      handleInit(msg);
+      break;
+    case "exec":
+      handleExec(msg);
+      break;
+    case "stdin":
+      handleStdin(msg.data);
+      break;
+    case "signal":
+      handleSignal(msg);
+      break;
+    case "resize":
+      _cols = msg.cols;
+      _rows = msg.rows;
+      break;
+    case "vfs-sync":
+      handleVFSSync(msg);
+      break;
+    case "vfs-chunk":
+      handleVFSChunk(msg);
+      break;
+    case "spawn-result":
+      _spawnCallbacks.get(msg.requestId)?.(msg);
+      _spawnCallbacks.delete(msg.requestId);
+      break;
+    case "child-output": {
+      const cb = _childOutputCallbacks.get(msg.requestId);
+      if (cb) cb(msg.stream, msg.data);
+      break;
+    }
+    case "child-exit": {
+      const cb = _childExitCallbacks.get(msg.requestId);
+      if (cb) {
+        _childExitCallbacks.delete(msg.requestId);
+        _childOutputCallbacks.delete(msg.requestId);
+        cb(msg.exitCode, msg.stdout, msg.stderr);
+      }
+      break;
+    }
+    case "ipc-message": {
+      const ipcMsg = msg as any;
+      if (ipcMsg.targetRequestId !== undefined) {
+        // This worker is a PARENT — route to the fork callback for a child
+        const ipcCb = _ipcCallbacks.get(ipcMsg.targetRequestId);
+        if (ipcCb) ipcCb(ipcMsg.data);
+      } else {
+        // This worker IS a forked child — emit on process object
+        handleIPCMessage(ipcMsg.data);
+      }
+      break;
+    }
+    case "http-request":
+      handleHttpRequest(msg as any);
+      break;
+    case "ws-upgrade":
+      handleWsUpgrade(msg as any);
+      break;
+    case "ws-data":
+      handleWsData(msg as any);
+      break;
+    case "ws-close":
+      handleWsClose(msg as any);
+      break;
+    default:
+      break;
+  }
+});
+
+// --- Init ---
+
+function handleInit(msg: MainToWorker_Init): void {
+  _pid = msg.pid;
+  _cwd = msg.cwd || "/";
+  _env = msg.env || {};
+
+  _volume = MemoryVolume.fromBinarySnapshot(msg.snapshot);
+
+  // Watch local writes → forward to main. Suppressed during inbound vfs-sync to prevent echo.
+  _volume.watch("/", { recursive: true }, (event, filename) => {
+    if (!filename || _suppressVFSWatch) return;
+    try {
+      if (_volume!.existsSync(filename)) {
+        const stat = _volume!.statSync(filename);
+        if (stat.isDirectory()) {
+          post({
+            type: "vfs-write",
+            path: filename,
+            content: new ArrayBuffer(0),
+            isDirectory: true,
+          });
+        } else {
+          const data = _volume!.readFileSync(filename);
+          const buffer = (data.buffer as ArrayBuffer).slice(
+            data.byteOffset,
+            data.byteOffset + data.byteLength,
+          );
+          post({ type: "vfs-write", path: filename, content: buffer, isDirectory: false }, [buffer]);
+        }
+      } else {
+        post({ type: "vfs-delete", path: filename });
+      }
+    } catch {
+      /* ignore */
+    }
+  });
+
+  if (msg.syncBuffer) {
+    _syncChannelWorker = new SyncChannelWorker(msg.syncBuffer);
+  }
+
+  _initialized = true;
+  post({ type: "ready", pid: _pid });
+}
+
+// --- Shell init (lazy) ---
+
+async function ensureShell(): Promise<typeof import("../polyfills/child_process")> {
+  if (!_shellMod) {
+    _shellMod = await import("../polyfills/child_process");
+    // Must be eager — sync require('child_process') needs this before any microtask fires
+    setChildProcessPolyfill(_shellMod);
+  }
+  if (!_shellInitialized && _volume) {
+    _shellMod.initShellExec(_volume, { cwd: _cwd, env: _env });
+    if (_syncChannelWorker) {
+      _shellMod.setSyncChannel(_syncChannelWorker);
+    }
+    _shellMod.setSpawnChildCallback(spawnChild);
+    _shellMod.setForkChildCallback(forkChild);
+    const wtMod = await import("../polyfills/worker_threads");
+    wtMod.setWorkerThreadForkCallback(workerThreadFork);
+    const httpMod = await import("../polyfills/http");
+    httpMod.setServerListenCallback((port: number) => {
+      post({ type: "server-listen", port, hostname: "0.0.0.0" });
+    });
+    httpMod.setServerCloseCallback((port: number) => {
+      post({ type: "server-close", port });
+    });
+    _shellInitialized = true;
+  }
+  return _shellMod;
+}
+
+// --- Exec ---
+
+async function handleExec(msg: MainToWorker_Exec): Promise<void> {
+  if (!_volume) {
+    postStderr("Error: VFS not initialized\n");
+    postExit(1, "", "Error: VFS not initialized\n");
+    return;
+  }
+
+  _abortController = new AbortController();
+
+  if (msg.cwd) {
+    _cwd = msg.cwd;
+    // Must sync shell cwd too, otherwise it keeps its old cwd
+    if (_shellMod) _shellMod.setShellCwd(msg.cwd);
+  }
+  if (msg.env) Object.assign(_env, msg.env);
+
+  if (msg.isShell) {
+    await handleShellExec(msg);
+  } else {
+    await handleFileExec(msg);
+  }
+}
+
+// --- Shell command execution ---
+
+async function handleShellExec(msg: MainToWorker_Exec): Promise<void> {
+  const shellCmd = msg.shellCommand || "";
+  const persistent = !!msg.persistent;
+
+  try {
+    const shell = await ensureShell();
+
+    shell.setStreamingCallbacks({
+      onStdout: postStdout,
+      onStderr: postStderr,
+      signal: _abortController!.signal,
+      getCols: () => _cols,
+      getRows: () => _rows,
+      onRawModeChange: postStdinRawStatus,
+    });
+
+    // shellExec() NOT child_process.exec() — the latter spawns a new worker, causing recursion
+    shell.shellExec(shellCmd, {}, (error, stdout, stderr) => {
+      // Don't clearStreamingCallbacks — background children (e.g. vite dev)
+      // may still need the output sinks. Cleaned up on worker termination.
+
+      const newCwd = shell.getShellCwd();
+      if (newCwd !== _cwd) {
+        _cwd = newCwd;
+        postCwdChange(newCwd);
+      }
+
+      postStdinRawStatus(false);
+
+      const exitCode = error ? ((error as any).code ?? 1) : 0;
+      const outStr = String(stdout ?? "");
+      const errStr = String(stderr ?? "");
+
+      if (persistent) {
+        post({ type: "shell-done", exitCode, stdout: outStr, stderr: errStr });
+      } else {
+        postExit(exitCode, outStr, errStr);
+      }
+    });
+  } catch (e: any) {
+    postError(e?.message || String(e), e?.stack);
+    if (persistent) {
+      post({ type: "shell-done", exitCode: 1, stdout: "", stderr: e?.message || String(e) });
+    } else {
+      postExit(1, "", e?.message || String(e));
+    }
+  }
+}
+
+// --- IPC message handler ---
+
+function handleIPCMessage(data: unknown): void {
+  if (_shellMod) {
+    _shellMod.handleIPCFromParent(data);
+  } else if (_ipcMessageHandler) {
+    _ipcMessageHandler(data);
+  }
+}
+
+// --- File execution (node script.js) ---
+
+async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
+  const filePath = msg.filePath;
+  const args = msg.args || [];
+
+  try {
+    const shell = await ensureShell();
+
+    // Enable IPC for forks: process.send() → postMessage to main
+    if (msg.isFork) {
+      shell.setIPCSend((data: unknown) => {
+        post({ type: "ipc-message", data });
+      });
+    }
+
+    let workerThreadsOverride: {
+      isMainThread: boolean;
+      parentPort: unknown;
+      workerData: unknown;
+      threadId: number;
+    } | undefined;
+
+    if (msg.isWorkerThread) {
+      const { MessagePort } = await import("../polyfills/worker_threads");
+      const pp = new MessagePort();
+      pp.postMessage = (data: unknown) => {
+        post({ type: "ipc-message", data });
+      };
+
+      shell.setIPCReceiveHandler((data: unknown) => {
+        pp.emit("message", data);
+      });
+
+      workerThreadsOverride = {
+        isMainThread: false,
+        parentPort: pp,
+        workerData: msg.workerData ?? null,
+        threadId: msg.threadId ?? 0,
+      };
+    }
+
+    shell.setStreamingCallbacks({
+      onStdout: postStdout,
+      onStderr: postStderr,
+      signal: _abortController!.signal,
+      getCols: () => _cols,
+      getRows: () => _rows,
+      onRawModeChange: postStdinRawStatus,
+    });
+
+    const ctx = {
+      cwd: _cwd,
+      env: _env,
+      volume: _volume!,
+      exec: async (cmd: string, opts?: { cwd?: string; env?: Record<string, string> }) => {
+        // Needed for ShellContext type compat
+        return new Promise<{ stdout: string; stderr: string; exitCode: number }>((resolve) => {
+          shell.exec(cmd, opts ?? {}, (error: any, stdout: any, stderr: any) => {
+            resolve({
+              stdout: String(stdout ?? ""),
+              stderr: String(stderr ?? ""),
+              exitCode: error ? (error.code ?? 1) : 0,
+            });
+          });
+        });
+      },
+    };
+
+    const result = await shell.executeNodeBinary(filePath, args, ctx, {
+      isFork: !!msg.isFork,
+      workerThreadsOverride,
+    });
+
+    shell.clearStreamingCallbacks();
+    postExit(result.exitCode, result.stdout, result.stderr);
+  } catch (e: any) {
+    // Safety net — executeNodeBinary handles its own errors, but just in case:
+    const errMsg = e?.message || String(e);
+    postStderr(`Error: ${errMsg}\n`);
+    postExit(1, "", errMsg);
+  }
+}
+
+// --- Stdin ---
+
+function handleStdin(data: string): void {
+  if (!_shellMod) return;
+  try {
+    _shellMod.sendStdin(data);
+  } catch {
+    /* ignore */
+  }
+}
+
+// --- Signal ---
+
+function handleSignal(msg: { signal: string }): void {
+  if (msg.signal === "SIGINT" || msg.signal === "SIGTERM") {
+    if (_abortController) {
+      _abortController.abort();
+    }
+  }
+}
+
+// --- VFS sync ---
+
+function handleVFSSync(msg: { path: string; content: ArrayBuffer | null; isDirectory: boolean }): void {
+  if (!_volume) return;
+  // Suppress watcher — these came from another worker, don't echo back
+  _suppressVFSWatch = true;
+  try {
+    if (msg.content === null) {
+      if (_volume.existsSync(msg.path)) {
+        const stat = _volume.statSync(msg.path);
+        if (stat.isDirectory()) {
+          _volume.rmdirSync(msg.path);
+        } else {
+          _volume.unlinkSync(msg.path);
+        }
+      }
+    } else if (msg.isDirectory) {
+      if (!_volume.existsSync(msg.path)) {
+        _volume.mkdirSync(msg.path, { recursive: true });
+      }
+    } else {
+      const parentDir = msg.path.substring(0, msg.path.lastIndexOf("/")) || "/";
+      if (parentDir !== "/" && !_volume.existsSync(parentDir)) {
+        _volume.mkdirSync(parentDir, { recursive: true });
+      }
+      _volume.writeFileSync(msg.path, new Uint8Array(msg.content));
+    }
+  } catch {
+    /* ignore */
+  } finally {
+    _suppressVFSWatch = false;
+  }
+}
+
+let _vfsChunks: Array<{ data: ArrayBuffer; manifest: Array<{ path: string; offset: number; length: number; isDirectory: boolean }> } | null> = [];
+
+function handleVFSChunk(msg: { chunkIndex: number; totalChunks: number; data: ArrayBuffer; manifest: Array<{ path: string; offset: number; length: number; isDirectory: boolean }> }): void {
+  _vfsChunks[msg.chunkIndex] = { data: msg.data, manifest: msg.manifest };
+  const received = _vfsChunks.filter(Boolean).length;
+  if (received === msg.totalChunks) {
+    // All chunks received — apply to volume
+    _suppressVFSWatch = true;
+    try {
+      if (_volume) {
+        for (const chunk of _vfsChunks) {
+          if (!chunk) continue;
+          const data = new Uint8Array(chunk.data);
+          for (const entry of chunk.manifest) {
+            if (entry.isDirectory) {
+              if (!_volume.existsSync(entry.path)) {
+                _volume.mkdirSync(entry.path, { recursive: true });
+              }
+            } else {
+              const parentDir = entry.path.substring(0, entry.path.lastIndexOf("/")) || "/";
+              if (parentDir !== "/" && !_volume.existsSync(parentDir)) {
+                _volume.mkdirSync(parentDir, { recursive: true });
+              }
+              _volume.writeFileSync(entry.path, data.slice(entry.offset, entry.offset + entry.length));
+            }
+          }
+        }
+      }
+    } finally {
+      _suppressVFSWatch = false;
+    }
+    _vfsChunks = [];
+  }
+}
+
+// --- HTTP request dispatch ---
+
+async function handleHttpRequest(msg: {
+  requestId: number;
+  port: number;
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  body: string | null;
+}): Promise<void> {
+  try {
+    const httpMod = await import("../polyfills/http");
+    const server = httpMod.getServer(msg.port);
+    if (!server) {
+      post({
+        type: "http-response",
+        requestId: msg.requestId,
+        statusCode: 503,
+        statusMessage: "Service Unavailable",
+        headers: { "Content-Type": "text/plain" },
+        body: `No server on port ${msg.port}`,
+      } as any);
+      return;
+    }
+
+    const { Buffer } = await import("../polyfills/buffer");
+    const bodyBuf = msg.body ? Buffer.from(msg.body) : undefined;
+    const result = await server.dispatchRequest(
+      msg.method,
+      msg.path,
+      msg.headers,
+      bodyBuf,
+    );
+    // Can't transfer Buffer via postMessage, convert to string
+    let bodyStr = "";
+    if (result.body) {
+      if (typeof result.body === "string") {
+        bodyStr = result.body;
+      } else if (result.body instanceof Uint8Array || Buffer.isBuffer(result.body)) {
+        bodyStr = new TextDecoder().decode(result.body);
+      } else {
+        bodyStr = String(result.body);
+      }
+    }
+
+    post({
+      type: "http-response",
+      requestId: msg.requestId,
+      statusCode: result.statusCode,
+      statusMessage: result.statusMessage,
+      headers: result.headers,
+      body: bodyStr,
+    } as any);
+  } catch (e: any) {
+    console.error(`[DEBUG] handleHttpRequest caught:`, e?.message, "\nStack:", e?.stack?.split?.("\n")?.slice(0, 8)?.join("\n"));
+    post({
+      type: "http-response",
+      requestId: msg.requestId,
+      statusCode: 500,
+      statusMessage: "Internal Server Error",
+      headers: { "Content-Type": "text/plain" },
+      body: e?.message || "Internal Server Error",
+    } as any);
+  }
+}
+
+// --- WebSocket upgrade handling ---
+
+// Active WS connections: uid → socket (TcpSocket in the worker)
+const _wsConnections = new Map<string, any>();
+
+async function handleWsUpgrade(msg: {
+  uid: string;
+  port: number;
+  path: string;
+  headers: Record<string, string>;
+}): Promise<void> {
+  try {
+    const httpMod = await import("../polyfills/http");
+    const { encodeFrame, decodeFrame } = httpMod;
+    const { Buffer } = await import("../polyfills/buffer");
+
+    const server = httpMod.getServer(msg.port);
+    if (!server) {
+      post({ type: "ws-frame", uid: msg.uid, kind: "error", message: `No server on port ${msg.port}` } as any);
+      return;
+    }
+
+    const { socket } = server.dispatchUpgrade(msg.path || "/", msg.headers);
+
+    let outboundBuf = new Uint8Array(0);
+    let handshakeDone = false;
+
+    // Intercept socket.write to decode WS frames and relay to main thread
+    socket.write = ((
+      chunk: Uint8Array | string,
+      encOrCb?: string | ((err?: Error | null) => void),
+      cb?: (err?: Error | null) => void,
+    ): boolean => {
+      const raw = typeof chunk === "string" ? Buffer.from(chunk) : new Uint8Array(chunk);
+      const fn = typeof encOrCb === "function" ? encOrCb : cb;
+
+      if (!handshakeDone) {
+        const text = new TextDecoder().decode(raw);
+        if (text.startsWith("HTTP/1.1 101")) {
+          handshakeDone = true;
+          post({ type: "ws-frame", uid: msg.uid, kind: "open" } as any);
+          if (fn) queueMicrotask(() => fn(null));
+          return true;
+        }
+      }
+
+      const merged = new Uint8Array(outboundBuf.length + raw.length);
+      merged.set(outboundBuf, 0);
+      merged.set(raw, outboundBuf.length);
+      outboundBuf = merged;
+
+      while (outboundBuf.length >= 2) {
+        const frame = decodeFrame(outboundBuf);
+        if (!frame) break;
+        outboundBuf = outboundBuf.slice(frame.consumed);
+
+        switch (frame.op) {
+          case 0x01: { // TEXT
+            const text = new TextDecoder().decode(frame.data);
+            post({ type: "ws-frame", uid: msg.uid, kind: "text", data: text } as any);
+            break;
+          }
+          case 0x02: // BINARY
+            post({ type: "ws-frame", uid: msg.uid, kind: "binary", bytes: Array.from(frame.data) } as any);
+            break;
+          case 0x08: { // CLOSE
+            const code = frame.data.length >= 2 ? (frame.data[0] << 8) | frame.data[1] : 1000;
+            post({ type: "ws-frame", uid: msg.uid, kind: "close", code } as any);
+            _wsConnections.delete(msg.uid);
+            break;
+          }
+          case 0x09: // PING — send pong back
+            socket._feedData(Buffer.from(encodeFrame(0x0A, frame.data, true)));
+            break;
+        }
+      }
+
+      if (fn) queueMicrotask(() => fn(null));
+      return true;
+    }) as any;
+
+    _wsConnections.set(msg.uid, socket);
+  } catch (e: any) {
+    post({ type: "ws-frame", uid: msg.uid, kind: "error", message: e?.message || "WS upgrade failed" } as any);
+  }
+}
+
+function handleWsData(msg: { uid: string; frame: number[] }): void {
+  const socket = _wsConnections.get(msg.uid);
+  if (!socket) return;
+  try {
+    const { Buffer } = require("../polyfills/buffer");
+    socket._feedData(Buffer.from(new Uint8Array(msg.frame)));
+  } catch { /* ignore */ }
+}
+
+function handleWsClose(msg: { uid: string; code: number }): void {
+  const socket = _wsConnections.get(msg.uid);
+  if (!socket) return;
+  try {
+    const codeBuf = new Uint8Array(2);
+    codeBuf[0] = (msg.code >> 8) & 0xff;
+    codeBuf[1] = msg.code & 0xff;
+    const { encodeFrame } = require("../polyfills/http");
+    const { Buffer } = require("../polyfills/buffer");
+    socket._feedData(Buffer.from(encodeFrame(0x08, codeBuf, true)));
+  } catch { /* ignore */ }
+  try { socket.destroy(); } catch { /* ignore */ }
+  _wsConnections.delete(msg.uid);
+}
+
+// --- Child process spawning ---
+
+// Forks a child process via main thread. Returns IPC handles immediately;
+// output and exit arrive via callbacks.
+export function forkChild(
+  modulePath: string,
+  args: string[],
+  opts: {
+    cwd: string;
+    env: Record<string, string>;
+    onStdout?: (data: string) => void;
+    onStderr?: (data: string) => void;
+    onIPC?: (data: unknown) => void;
+    onExit?: (exitCode: number) => void;
+  },
+): { sendIPC: (data: unknown) => void; disconnect: () => void; requestId: number } {
+  const requestId = _nextRequestId++;
+
+  if (opts.onIPC) {
+    _ipcCallbacks.set(requestId, opts.onIPC);
+  }
+
+  _spawnCallbacks.set(requestId, (result: any) => {
+    if (result.error) {
+      _ipcCallbacks.delete(requestId);
+      opts.onStderr?.(`Fork error: ${result.error}\n`);
+      opts.onExit?.(1);
+      return;
+    }
+
+    _childOutputCallbacks.set(requestId, (stream: string, data: string) => {
+      if (stream === "stdout") {
+        opts.onStdout?.(data);
+      } else {
+        opts.onStderr?.(data);
+      }
+    });
+
+    _childExitCallbacks.set(requestId, (exitCode: number) => {
+      _ipcCallbacks.delete(requestId);
+      opts.onExit?.(exitCode);
+    });
+  });
+
+  post({
+    type: "fork-request",
+    requestId,
+    modulePath,
+    args,
+    cwd: opts.cwd,
+    env: opts.env,
+  });
+
+  return {
+    requestId,
+    sendIPC: (data: unknown) => {
+      post({
+        type: "ipc-message",
+        targetRequestId: requestId,
+        data,
+      });
+    },
+    disconnect: () => {
+      _ipcCallbacks.delete(requestId);
+      _childOutputCallbacks.delete(requestId);
+      _childExitCallbacks.delete(requestId);
+    },
+  };
+}
+
+// Same as forkChild but for worker_threads — posts "workerthread-request" with workerData/threadId
+function workerThreadFork(
+  modulePath: string,
+  opts: {
+    workerData: unknown;
+    threadId: number;
+    isEval?: boolean;
+    cwd: string;
+    env: Record<string, string>;
+    onMessage: (data: unknown) => void;
+    onError: (err: Error) => void;
+    onExit: (code: number) => void;
+    onStdout?: (data: string) => void;
+    onStderr?: (data: string) => void;
+  },
+): { postMessage: (data: unknown) => void; terminate: () => void; requestId: number } {
+  const requestId = _nextRequestId++;
+
+  _ipcCallbacks.set(requestId, (data: unknown) => {
+    opts.onMessage(data);
+  });
+
+  _spawnCallbacks.set(requestId, (result: any) => {
+    if (result.error) {
+      _ipcCallbacks.delete(requestId);
+      opts.onError(new Error(result.error));
+      return;
+    }
+
+    _childOutputCallbacks.set(requestId, (stream: string, data: string) => {
+      if (stream === "stdout") {
+        opts.onStdout?.(data);
+      } else {
+        opts.onStderr?.(data);
+      }
+    });
+
+    _childExitCallbacks.set(requestId, (exitCode: number) => {
+      _ipcCallbacks.delete(requestId);
+      opts.onExit(exitCode);
+    });
+  });
+
+  post({
+    type: "workerthread-request",
+    requestId,
+    modulePath,
+    isEval: opts.isEval,
+    args: [],
+    cwd: opts.cwd,
+    env: opts.env,
+    workerData: opts.workerData,
+    threadId: opts.threadId,
+  } as any);
+
+  return {
+    requestId,
+    postMessage: (data: unknown) => {
+      post({
+        type: "ipc-message",
+        targetRequestId: requestId,
+        data,
+      });
+    },
+    terminate: () => {
+      _ipcCallbacks.delete(requestId);
+      _childOutputCallbacks.delete(requestId);
+      _childExitCallbacks.delete(requestId);
+    },
+  };
+}
+
+// Spawns a child process via main thread. Resolves when child exits.
+// onStdout/onStderr fire in real-time as child-output messages arrive.
+export function spawnChild(
+  command: string,
+  args: string[],
+  opts?: {
+    cwd?: string;
+    env?: Record<string, string>;
+    stdio?: "pipe" | "inherit";
+    onStdout?: (data: string) => void;
+    onStderr?: (data: string) => void;
+  },
+): Promise<{ pid: number; exitCode: number; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const requestId = _nextRequestId++;
+    let stdout = "";
+    let stderr = "";
+
+    _spawnCallbacks.set(requestId, (result: any) => {
+      if (result.error) {
+        reject(new Error(result.error));
+        return;
+      }
+
+      _childOutputCallbacks.set(requestId, (stream: string, data: string) => {
+        if (stream === "stdout") {
+          stdout += data;
+          opts?.onStdout?.(data);
+        } else {
+          stderr += data;
+          opts?.onStderr?.(data);
+        }
+      });
+
+      _childExitCallbacks.set(requestId, (exitCode: number, fullStdout: string, fullStderr: string) => {
+        resolve({
+          pid: result.pid,
+          exitCode,
+          stdout: fullStdout || stdout,
+          stderr: fullStderr || stderr,
+        });
+      });
+    });
+
+    post({
+      type: "spawn-request",
+      requestId,
+      command,
+      args,
+      cwd: opts?.cwd || _cwd,
+      env: opts?.env || _env,
+      stdio: opts?.stdio || "pipe",
+    });
+  });
+}
