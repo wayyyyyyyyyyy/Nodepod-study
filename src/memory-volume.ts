@@ -266,7 +266,7 @@ export class MemoryVolume {
           vol.mkdirSync(parentDir, { recursive: true });
         }
         const content = fullData.slice(entry.offset, entry.offset + entry.length);
-        vol.writeInternal(entry.path, content, false);
+        vol.writeInternal(vol.normalize(entry.path), content, false);
       }
     }
 
@@ -297,7 +297,7 @@ export class MemoryVolume {
         if (parentDir !== '/' && !vol.existsSync(parentDir)) {
           vol.mkdirSync(parentDir, { recursive: true });
         }
-        vol.writeInternal(entry.path, content, false);
+        vol.writeInternal(vol.normalize(entry.path), content, false);
       }
     }
 
@@ -317,26 +317,33 @@ export class MemoryVolume {
     return '/' + resolved.join('/');
   }
 
+  // assumes pre-normalized input (starts with '/', no '..' or double slashes)
   private segments(p: string): string[] {
-    return this.normalize(p).split('/').filter(Boolean);
+    if (p === '/') return [];
+    // skip leading '/' then split — no empty strings since input is normalized
+    return p.substring(1).split('/');
   }
 
   private parentOf(p: string): string {
-    const norm = this.normalize(p);
-    const idx = norm.lastIndexOf('/');
-    return idx <= 0 ? '/' : norm.slice(0, idx);
+    const idx = p.lastIndexOf('/');
+    return idx <= 0 ? '/' : p.slice(0, idx);
   }
 
   private nameOf(p: string): string {
-    const norm = this.normalize(p);
-    const idx = norm.lastIndexOf('/');
-    return norm.slice(idx + 1);
+    const idx = p.lastIndexOf('/');
+    return p.slice(idx + 1);
   }
 
   private locateRaw(p: string): VolumeNode | undefined {
-    const segs = this.segments(p);
+    if (p === '/') return this.tree;
     let current = this.tree;
-    for (const seg of segs) {
+    let start = 1; // skip leading '/'
+    const len = p.length;
+    while (start < len) {
+      let end = p.indexOf('/', start);
+      if (end === -1) end = len;
+      const seg = p.substring(start, end);
+      start = end + 1;
       if (current.kind === 'symlink') {
         const resolved = this.locateRaw(current.target!);
         if (!resolved || resolved.kind !== 'directory') return undefined;
@@ -361,9 +368,15 @@ export class MemoryVolume {
   }
 
   private ensureDir(p: string): VolumeNode {
-    const segs = this.segments(p);
+    if (p === '/') return this.tree;
     let current = this.tree;
-    for (const seg of segs) {
+    let start = 1; // skip leading '/'
+    const len = p.length;
+    while (start < len) {
+      let end = p.indexOf('/', start);
+      if (end === -1) end = len;
+      const seg = p.substring(start, end);
+      start = end + 1;
       if (!current.children) current.children = new Map();
       let child = current.children.get(seg);
       if (!child) {
@@ -379,15 +392,14 @@ export class MemoryVolume {
 
   // ---- Internal write ----
 
-  private writeInternal(p: string, data: string | Uint8Array, notify: boolean): void {
-    const norm = this.normalize(p);
-    // Derive parent/name directly — norm is already normalized, no need to re-normalize
+  // expects pre-normalized path
+  private writeInternal(norm: string, data: string | Uint8Array, notify: boolean): void {
     const lastSlash = norm.lastIndexOf('/');
     const parentPath = lastSlash <= 0 ? '/' : norm.slice(0, lastSlash);
     const name = norm.slice(lastSlash + 1);
 
     if (!name) {
-      throw new Error(`EISDIR: illegal operation on a directory, '${p}'`);
+      throw new Error(`EISDIR: illegal operation on a directory, '${norm}'`);
     }
 
     const parent = this.ensureDir(parentPath);
@@ -410,11 +422,12 @@ export class MemoryVolume {
   // ---- Public synchronous API ----
 
   existsSync(p: string): boolean {
-    return this.locate(p) !== undefined;
+    return this.locate(this.normalize(p)) !== undefined;
   }
 
   statSync(p: string): FileStat {
-    const node = this.locate(p);
+    const norm = this.normalize(p);
+    const node = this.locate(norm);
     if (!node) throw makeSystemError('ENOENT', 'stat', p);
 
     const fileSize = node.kind === 'file' ? (node.content?.length || 0) : 0;
@@ -454,7 +467,8 @@ export class MemoryVolume {
   }
 
   lstatSync(p: string): FileStat {
-    const node = this.locateRaw(p);
+    const norm = this.normalize(p);
+    const node = this.locateRaw(norm);
     if (!node) throw makeSystemError('ENOENT', 'lstat', p);
 
     if (node.kind === 'symlink') {
@@ -491,13 +505,14 @@ export class MemoryVolume {
         birthtimeNs: BigInt(ts) * 1000000n,
       };
     }
-    return this.statSync(p);
+    return this.statSync(norm);
   }
 
   readFileSync(p: string): Uint8Array;
   readFileSync(p: string, encoding: 'utf8' | 'utf-8'): string;
   readFileSync(p: string, encoding?: 'utf8' | 'utf-8'): Uint8Array | string {
-    const node = this.locate(p);
+    const norm = this.normalize(p);
+    const node = this.locate(norm);
     if (!node) throw makeSystemError('ENOENT', 'open', p);
     if (node.kind !== 'file') throw makeSystemError('EISDIR', 'read', p);
 
@@ -510,8 +525,7 @@ export class MemoryVolume {
 
   writeFileSync(p: string, data: string | Uint8Array): void {
     const norm = this.normalize(p);
-    const existed = this.locate(norm) !== undefined;
-    this.writeInternal(p, data, true);
+    this.writeInternal(norm, data, true);
   }
 
   mkdirSync(p: string, options?: { recursive?: boolean }): void {
@@ -539,7 +553,8 @@ export class MemoryVolume {
   }
 
   readdirSync(p: string): string[] {
-    const node = this.locate(p);
+    const norm = this.normalize(p);
+    const node = this.locate(norm);
     if (!node) throw makeSystemError('ENOENT', 'scandir', p);
     if (node.kind !== 'directory') throw makeSystemError('ENOTDIR', 'scandir', p);
     return Array.from(node.children!.keys());
@@ -654,8 +669,7 @@ export class MemoryVolume {
   }
 
   linkSync(existingPath: string, newPath: string): void {
-    // hard links share the same content reference
-    const existing = this.locate(existingPath);
+    const existing = this.locate(this.normalize(existingPath));
     if (!existing) throw makeSystemError('ENOENT', 'link', existingPath);
     if (existing.kind !== 'file') throw makeSystemError('EISDIR', 'link', existingPath);
 
@@ -685,14 +699,15 @@ export class MemoryVolume {
   appendFileSync(p: string, data: string | Uint8Array): void {
     const norm = this.normalize(p);
     let existing: Uint8Array = new Uint8Array(0);
-    try {
-      existing = new Uint8Array(this.readFileSync(norm));
-    } catch { /* file doesn't exist yet */ }
+    const node = this.locate(norm);
+    if (node && node.kind === 'file') {
+      existing = node.content || new Uint8Array(0);
+    }
     const bytes = typeof data === 'string' ? this.textEncoder.encode(data) : data;
     const combined = new Uint8Array(existing.length + bytes.length);
     combined.set(existing);
     combined.set(bytes, existing.length);
-    this.writeFileSync(norm, combined);
+    this.writeInternal(norm, combined, true);
   }
 
   truncateSync(p: string, len: number = 0): void {

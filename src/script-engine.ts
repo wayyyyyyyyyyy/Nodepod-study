@@ -117,8 +117,9 @@ import {
 } from "resolve.exports";
 import {
   esmToCjs,
-  stripTopLevelAwait,
+  collectEsmCjsPatches,
   hasTopLevelAwait,
+  stripTopLevelAwait,
 } from "./syntax-transforms";
 import { getCachedModule, precompileWasm, compileWasmInWorker } from "./helpers/wasm-cache";
 import * as acorn from "acorn";
@@ -263,7 +264,7 @@ function looksLikeTypeScript(source: string): boolean {
 function traverseAst(node: any, visitor: (n: any) => void): void {
   if (!node || typeof node !== "object") return;
   if (typeof node.type === "string") visitor(node);
-  for (const key of Object.keys(node)) {
+  for (const key in node) {
     if (
       key === "type" ||
       key === "start" ||
@@ -275,7 +276,8 @@ function traverseAst(node: any, visitor: (n: any) => void): void {
     const val = node[key];
     if (val && typeof val === "object") {
       if (Array.isArray(val)) {
-        for (const item of val) {
+        for (let i = 0; i < val.length; i++) {
+          const item = val[i];
           if (item && typeof item === "object" && typeof item.type === "string")
             traverseAst(item, visitor);
         }
@@ -309,6 +311,7 @@ function convertViaAst(source: string, filePath: string): string {
   }) as any;
   const patches: Array<[number, number, string]> = [];
 
+  // collect import.meta and import() patches
   traverseAst(ast, (node: any) => {
     if (
       node.type === "MetaProperty" &&
@@ -327,18 +330,21 @@ function convertViaAst(source: string, filePath: string): string {
   );
   const hasExportDecl = ast.body.some((n: any) => n.type?.startsWith("Export"));
 
+  // collect ESM→CJS patches from the same AST (no second parse)
+  if (hasImportDecl || hasExportDecl) {
+    collectEsmCjsPatches(ast, source, patches);
+  }
+
+  // apply all patches in one pass
   let output = source;
   patches.sort((a, b) => b[0] - a[0]);
   for (const [s, e, r] of patches)
     output = output.slice(0, s) + r + output.slice(e);
 
-  if (hasImportDecl || hasExportDecl) {
-    output = esmToCjs(output);
-    if (hasExportDecl) {
-      output =
-        'Object.defineProperty(exports, "__esModule", { value: true });\n' +
-        output;
-    }
+  if (hasExportDecl) {
+    output =
+      'Object.defineProperty(exports, "__esModule", { value: true });\n' +
+      output;
   }
 
   // .mjs files with `const require = createRequire(...)` hit TDZ after esmToCjs
@@ -2392,10 +2398,10 @@ function buildResolver(
       codeCache?.set(codeCacheKey, processedCode);
     }
 
-    // "full" de-async strips async from all functions so cross-module calls work with __syncAwait
-    // "topLevelOnly" preserves genuine async behavior for non-TLA modules
-    const moduleHasTLA = resolved.endsWith(".cjs") ? false : hasTopLevelAwait(processedCode);
+    const isCjs = resolved.endsWith(".cjs");
+    const moduleHasTLA = !isCjs && hasTopLevelAwait(processedCode);
     const useFullDeAsync = deAsyncImports || moduleHasTLA;
+    if (!isCjs) processedCode = stripTopLevelAwait(processedCode, deAsyncImports ? "full" : "topLevelOnly");
 
     const childResolver = buildResolver(
       vol,
@@ -2414,13 +2420,6 @@ function buildResolver(
 
     try {
       const metaUrl = "file://" + resolved;
-      // CJS files: skip — would corrupt await inside async functions
-      if (!resolved.endsWith(".cjs")) {
-        processedCode = stripTopLevelAwait(
-          processedCode,
-          useFullDeAsync ? "full" : "topLevelOnly",
-        );
-      }
       const wrapper = buildModuleWrapper(processedCode);
 
       let fn;
@@ -3121,7 +3120,10 @@ export class ScriptEngine {
       processed = convertModuleSyntax(processed, filename);
     }
 
-    const fileHasTLA = filename.endsWith(".cjs") ? false : hasTopLevelAwait(processed);
+    const isCjs = filename.endsWith(".cjs");
+    const fileHasTLA = !isCjs && hasTopLevelAwait(processed);
+    if (!isCjs) processed = stripTopLevelAwait(processed);
+
     const resolver = buildResolver(
       this.vol,
       this.fsBridge,
@@ -3136,12 +3138,6 @@ export class ScriptEngine {
 
     try {
       const metaUrl = "file://" + filename;
-      if (!filename.endsWith(".cjs")) {
-        processed = stripTopLevelAwait(
-          processed,
-          fileHasTLA ? "full" : "topLevelOnly",
-        );
-      }
       const wrapper = buildModuleWrapper(processed);
 
       const asyncLoader = makeDynamicLoader(resolver);
@@ -3233,6 +3229,7 @@ export class ScriptEngine {
       processed = convertModuleSyntax(processed, filename);
     }
     const tla = hasTopLevelAwait(processed);
+    const tlaStripped = stripTopLevelAwait(processed);
 
     // Don't propagate deAsyncImports from entry — it uses native await (async IIFE),
     // so deps don't need de-async. loadModule handles individual TLA modules.
@@ -3250,7 +3247,7 @@ export class ScriptEngine {
 
     if (!tla) {
       try {
-        processed = stripTopLevelAwait(processed);
+        processed = tlaStripped;
         const wrapper = buildModuleWrapper(processed);
         const asyncLoader = makeDynamicLoader(resolver);
         const fn = (0, eval)(wrapper);

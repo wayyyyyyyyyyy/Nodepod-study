@@ -161,6 +161,24 @@ describe("ScriptEngine", () => {
       );
       expect(result.exports).toBe(42);
     });
+
+    it("handles export function containing dynamic import() without corruption", () => {
+      const { engine } = createEngine({
+        "/project/plugin.js": [
+          'import path from "path";',
+          "export function helper() { return 1; }",
+          "export function main() {",
+          "  const loader = () => import('./other.js');",
+          "  return { loader, val: path.join('a', 'b') };",
+          "}",
+        ].join("\n"),
+      });
+      const result = engine.execute(
+        'const m = require("./plugin"); module.exports = m.main().val;',
+        "/project/index.js",
+      );
+      expect(result.exports).toBe("a/b");
+    });
   });
 
   describe("clearCache()", () => {

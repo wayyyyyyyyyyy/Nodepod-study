@@ -2,6 +2,40 @@
 
 import * as acorn from "acorn";
 
+// Pre-compiled regex patterns for fallback paths (avoid per-call compilation)
+const RE_AWAIT_QUICK = /\bawait\b/;
+const RE_ASYNC_QUICK = /\basync\b/;
+const RE_AWAIT_LOOKAHEAD = /(?<![.\w])await\s+(?=[\w$("'\[`!~+\-/])/;
+const RE_AWAIT_LOOKAHEAD_G = /(?<![.\w])await\s+(?=[\w$("'\[`!~+\-/])/g;
+const RE_ASYNC_FN_G = /(?<![.\w])async\s+(?=function[\s*(])/g;
+const RE_ASYNC_PAREN_G = /(?<![.\w])async\s+(?=\()/g;
+const RE_ASYNC_ARROW_G = /(?<![.\w])async\s+(?=\w+\s*=>)/g;
+const RE_TYPE_IMPORT_BRACES = /import\s+type\s+\{[^}]*\}\s+from\s+['"][^'"]+['"]\s*;?/g;
+const RE_TYPE_IMPORT_DEFAULT = /import\s+type\s+\w+\s+from\s+['"][^'"]+['"]\s*;?/g;
+const RE_TYPE_IMPORT_STAR = /import\s+type\s+\*\s+as\s+\w+\s+from\s+['"][^'"]+['"]\s*;?/g;
+const RE_MIXED_TYPE_IMPORT = /import\s+\{([^}]*\btype\s+\w+[^}]*)\}\s+from\s+['"]([^'"]+)['"]\s*;?/g;
+const RE_TYPE_EXPORT_FROM = /export\s+type\s+\{[^}]*\}\s+from\s+['"][^'"]+['"]\s*;?/g;
+const RE_TYPE_EXPORT = /export\s+type\s+\{[^}]*\}\s*;?/g;
+const RE_IMPORT_STAR = /import\s+\*\s+as\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?/g;
+const RE_IMPORT_DEFAULT_NAMED = /import\s+(\w+)\s*,\s*\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?/g;
+const RE_IMPORT_DEFAULT = /import\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?/g;
+const RE_IMPORT_NAMED = /import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?/g;
+const RE_IMPORT_SIDE_EFFECT = /import\s+['"]([^'"]+)['"]\s*;?/g;
+const RE_EXPORT_DEFAULT_CLASS = /export\s+default\s+class\s+(\w+)/g;
+const RE_EXPORT_DEFAULT_FN_NAMED = /export\s+default\s+function\s+(\w+)/g;
+const RE_EXPORT_DEFAULT_FN_ANON = /export\s+default\s+function\s*\(/g;
+const RE_EXPORT_DEFAULT = /export\s+default\s+/g;
+const RE_EXPORT_STAR = /export\s+\*\s+from\s+['"]([^'"]+)['"]\s*;?/g;
+const RE_EXPORT_NAMED_FROM = /export\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?/g;
+const RE_EXPORT_NAMED = /export\s+\{([^}]+)\}\s*;?/g;
+const RE_EXPORT_ASYNC_FN = /export\s+async\s+function\s+(\w+)/g;
+const RE_EXPORT_FN = /export\s+function\s+(\w+)/g;
+const RE_EXPORT_CLASS = /export\s+class\s+(\w+)/g;
+const RE_EXPORT_VAR = /export\s+(?:const|let|var)\s+(\w+)\s*=/g;
+const RE_AS_RENAME = /(\w+)\s+as\s+(\w+)/g;
+const RE_TYPE_SPEC = /^\s*type\s+\w+/;
+const RE_AS_SPLIT = /\s+as\s+/;
+
 export function esmToCjs(code: string): string {
   try {
     return esmToCjsViaAst(code);
@@ -10,22 +44,21 @@ export function esmToCjs(code: string): string {
   }
 }
 
-function esmToCjsViaAst(code: string): string {
-  const ast = acorn.parse(code, {
-    ecmaVersion: "latest",
-    sourceType: "module",
-  });
-  const patches: Array<[number, number, string]> = [];
-
-  const hasDefaultExport = (ast as any).body.some(
+// collect ESM→CJS patches from a pre-parsed AST, pushes into the patches array
+export function collectEsmCjsPatches(
+  ast: any,
+  code: string,
+  patches: Array<[number, number, string]>,
+): void {
+  const hasDefaultExport = ast.body.some(
     (n: any) => n.type === "ExportDefaultDeclaration",
   );
-  const hasNamedExport = (ast as any).body.some(
+  const hasNamedExport = ast.body.some(
     (n: any) => n.type === "ExportNamedDeclaration",
   );
   const mixedExports = hasDefaultExport && hasNamedExport;
 
-  for (const node of (ast as any).body) {
+  for (const node of ast.body) {
     if (node.type === "ImportDeclaration") {
       const src = node.source.value;
       const specs = node.specifiers;
@@ -90,7 +123,6 @@ function esmToCjsViaAst(code: string): string {
       }
     } else if (node.type === "ExportDefaultDeclaration") {
       const decl = node.declaration;
-      const bodyCode = code.slice(decl.start, node.end);
       const exportTarget = mixedExports ? "exports.default" : "module.exports";
 
       if (
@@ -98,14 +130,16 @@ function esmToCjsViaAst(code: string): string {
           decl.type === "ClassDeclaration") &&
         decl.id?.name
       ) {
-        // preserve the declaration so the name is bound in local scope
+        // Non-overlapping: remove "export default ", append binding
+        patches.push([node.start, decl.start, ""]);
         patches.push([
-          node.start,
           node.end,
-          `${bodyCode};\n${exportTarget} = ${decl.id.name};`,
+          node.end,
+          `;\n${exportTarget} = ${decl.id.name};`,
         ]);
       } else {
-        patches.push([node.start, node.end, `${exportTarget} = ${bodyCode}`]);
+        // Replace "export default " with assignment target
+        patches.push([node.start, decl.start, `${exportTarget} = `]);
       }
     } else if (node.type === "ExportNamedDeclaration") {
       if (node.declaration) {
@@ -115,49 +149,51 @@ function esmToCjsViaAst(code: string): string {
           decl.type === "ClassDeclaration"
         ) {
           const name = decl.id.name;
-          const bodyCode = code.slice(decl.start, node.end);
-          // emit declaration so name is bound locally, then export it
+          // Non-overlapping patches: remove "export " prefix, append binding
+          patches.push([node.start, decl.start, ""]);
           patches.push([
-            node.start,
             node.end,
-            `${bodyCode};\nexports.${name} = ${name};`,
+            node.end,
+            `;\nexports.${name} = ${name};`,
           ]);
         } else if (decl.type === "VariableDeclaration") {
-          const lines: string[] = [];
           const needsLiveBinding = decl.kind === "let" || decl.kind === "var";
           const hasDestructuring = decl.declarations.some(
             (d: any) =>
               d.id.type === "ObjectPattern" || d.id.type === "ArrayPattern",
           );
+          // Remove "export " prefix
+          patches.push([node.start, decl.start, ""]);
+          // Append export bindings after declaration
+          const bindings: string[] = [];
           if (hasDestructuring) {
-            const declCode = code.slice(decl.start, decl.end);
-            lines.push(declCode);
             for (const d of decl.declarations) {
               for (const name of extractBindingNames(d.id)) {
                 if (needsLiveBinding) {
-                  lines.push(
+                  bindings.push(
                     `Object.defineProperty(exports, ${JSON.stringify(name)}, { get() { return ${name}; }, enumerable: true })`,
                   );
                 } else {
-                  lines.push(`exports.${name} = ${name}`);
+                  bindings.push(`exports.${name} = ${name}`);
                 }
               }
             }
           } else {
-            const declCode = code.slice(decl.start, decl.end);
-            lines.push(declCode);
             for (const d of decl.declarations) {
               if (needsLiveBinding) {
-                // ESM live binding: getter so reassignments are visible to importers
-                lines.push(
+                bindings.push(
                   `Object.defineProperty(exports, ${JSON.stringify(d.id.name)}, { get() { return ${d.id.name}; }, enumerable: true })`,
                 );
               } else {
-                lines.push(`exports.${d.id.name} = ${d.id.name}`);
+                bindings.push(`exports.${d.id.name} = ${d.id.name}`);
               }
             }
           }
-          patches.push([node.start, node.end, lines.join(";\n") + ";"]);
+          patches.push([
+            node.end,
+            node.end,
+            "\n" + bindings.join(";\n") + ";",
+          ]);
         }
       } else if (node.source) {
         const src = node.source.value;
@@ -165,7 +201,6 @@ function esmToCjsViaAst(code: string): string {
         const lines = [`const ${tmp} = require(${JSON.stringify(src)})`];
         for (const spec of node.specifiers) {
           if (spec.local.name === "default") {
-            // handle both module.exports=X and exports.default=X conventions
             lines.push(
               `exports.${spec.exported.name} = ${tmp}.__esModule ? ${tmp}.default : ${tmp}`,
             );
@@ -191,6 +226,15 @@ function esmToCjsViaAst(code: string): string {
       ]);
     }
   }
+}
+
+function esmToCjsViaAst(code: string): string {
+  const ast = acorn.parse(code, {
+    ecmaVersion: "latest",
+    sourceType: "module",
+  });
+  const patches: Array<[number, number, string]> = [];
+  collectEsmCjsPatches(ast as any, code, patches);
 
   let output = code;
   patches.sort((a, b) => b[0] - a[0]);
@@ -234,9 +278,8 @@ function extractBindingNames(pattern: any): string[] {
   return [];
 }
 
-// detect whether code contains any top-level await (outside async functions)
 export function hasTopLevelAwait(code: string): boolean {
-  if (!/\bawait\b/.test(code)) return false;
+  if (!RE_AWAIT_QUICK.test(code)) return false;
 
   try {
     let ast: any;
@@ -278,7 +321,7 @@ export function hasTopLevelAwait(code: string): boolean {
         found = true;
       }
       if (!found) {
-        for (const key of Object.keys(node)) {
+        for (const key in node) {
           if (key === "type" || key === "start" || key === "end") continue;
           const val = node[key];
           if (val && typeof val === "object") walk(val);
@@ -290,23 +333,17 @@ export function hasTopLevelAwait(code: string): boolean {
     walk(ast);
     return found;
   } catch {
-    // fallback: conservative regex
-    return /(?<![.\w])await\s+(?=[\w$("'\[`!~+\-/])/.test(code);
+    return RE_AWAIT_LOOKAHEAD.test(code);
   }
 }
 
-// strip top-level await and optionally de-async inner functions.
-// "topLevelOnly": only replace top-level await with __syncAwait(), leave inner async intact.
-// "full": strip async from all functions, replace ALL awaits with __syncAwait().
-// full mode is needed for synchronous require() chains where async would wrap
-// returns in native Promises that syncAwait() can't unwrap.
 export function stripTopLevelAwait(
   code: string,
   mode: "topLevelOnly" | "full" = "topLevelOnly",
 ): string {
   const full = mode === "full";
-  if (!full && !/\bawait\b/.test(code)) return code;
-  if (full && !/\bawait\b/.test(code) && !/\basync\b/.test(code)) return code;
+  if (!full && !RE_AWAIT_QUICK.test(code)) return code;
+  if (full && !RE_AWAIT_QUICK.test(code) && !RE_ASYNC_QUICK.test(code)) return code;
 
   try {
     let ast: any;
@@ -328,12 +365,10 @@ export function stripTopLevelAwait(
 
     function walk(node: any) {
       if (!node || typeof node !== "object") return;
-
       if (Array.isArray(node)) {
         for (const child of node) walk(child);
         return;
       }
-
       if (typeof node.type !== "string") return;
 
       const isAsyncFn =
@@ -344,15 +379,12 @@ export function stripTopLevelAwait(
 
       if (isAsyncFn) insideAsync++;
 
-      // in full mode, strip async so functions return plain values (not native Promises).
-      // skip async generators -- yield semantics can't be replaced.
       if (full && isAsyncFn && !node.generator) {
         if (code.slice(node.start, node.start + 5) === "async") {
           let end = node.start + 5;
           while (end < code.length && (code[end] === " " || code[end] === "\t")) end++;
           patches.push([node.start, end, ""]);
         } else {
-          // method syntax: { async foo() {} }
           const searchStart = Math.max(0, node.start - 30);
           const region = code.slice(searchStart, node.start);
           const asyncIdx = region.lastIndexOf("async");
@@ -365,12 +397,9 @@ export function stripTopLevelAwait(
         }
       }
 
-      // Replace only the `await` keyword + trailing whitespace. We can't use
-      // node.argument.start because acorn doesn't produce ParenthesizedExpression
-      // nodes, so `await (expr)` would swallow the opening paren.
       if (node.type === "AwaitExpression") {
         if (full || insideAsync === 0) {
-          let awaitEnd = node.start + 5; // "await" is 5 chars
+          let awaitEnd = node.start + 5;
           while (
             awaitEnd < node.argument.start &&
             (code[awaitEnd] === " " || code[awaitEnd] === "\t" || code[awaitEnd] === "\n" || code[awaitEnd] === "\r")
@@ -382,7 +411,6 @@ export function stripTopLevelAwait(
         }
       }
 
-      // strip await from `for await (...of ...)`
       if (node.type === "ForOfStatement" && node.await) {
         if (full || insideAsync === 0) {
           const forEnd = node.start + 3;
@@ -397,12 +425,10 @@ export function stripTopLevelAwait(
         }
       }
 
-      for (const key of Object.keys(node)) {
+      for (const key in node) {
         if (key === "type" || key === "start" || key === "end") continue;
         const val = node[key];
-        if (val && typeof val === "object") {
-          walk(val);
-        }
+        if (val && typeof val === "object") walk(val);
       }
 
       if (isAsyncFn) insideAsync--;
@@ -419,113 +445,72 @@ export function stripTopLevelAwait(
     }
     return output;
   } catch {
-    // regex fallback -- can't reliably add closing parens, best-effort strip
     if (full) {
-      let out = code.replace(/(?<![.\w])await\s+(?=[\w$("'\[`!~+\-/])/g, "");
-      out = out.replace(/(?<![.\w])async\s+(?=function[\s*(])/g, "");
-      out = out.replace(/(?<![.\w])async\s+(?=\()/g, "");
-      out = out.replace(/(?<![.\w])async\s+(?=\w+\s*=>)/g, "");
+      let out = code.replace(RE_AWAIT_LOOKAHEAD_G, "");
+      out = out.replace(RE_ASYNC_FN_G, "");
+      out = out.replace(RE_ASYNC_PAREN_G, "");
+      out = out.replace(RE_ASYNC_ARROW_G, "");
       return out;
     }
-    // topLevelOnly: strip top-level await keyword
-    return code.replace(
-      /(?<![.\w])await\s+(?=[\w$("'\[`!~+\-/])/g,
-      "",
-    );
+    return code.replace(RE_AWAIT_LOOKAHEAD_G, "");
   }
 }
 
 function esmToCjsViaRegex(code: string): string {
   let out = code;
   // strip TS type-only imports
-  out = out.replace(
-    /import\s+type\s+\{[^}]*\}\s+from\s+['"][^'"]+['"]\s*;?/g,
-    "",
-  );
-  out = out.replace(
-    /import\s+type\s+\w+\s+from\s+['"][^'"]+['"]\s*;?/g,
-    "",
-  );
-  out = out.replace(
-    /import\s+type\s+\*\s+as\s+\w+\s+from\s+['"][^'"]+['"]\s*;?/g,
-    "",
-  );
+  out = out.replace(RE_TYPE_IMPORT_BRACES, "");
+  out = out.replace(RE_TYPE_IMPORT_DEFAULT, "");
+  out = out.replace(RE_TYPE_IMPORT_STAR, "");
   // remove inline type specifiers from mixed imports
   out = out.replace(
-    /import\s+\{([^}]*\btype\s+\w+[^}]*)\}\s+from\s+['"]([^'"]+)['"]\s*;?/g,
+    RE_MIXED_TYPE_IMPORT,
     (_m, specs: string, src: string) => {
       const kept = specs
         .split(",")
-        .filter((s: string) => !/^\s*type\s+\w+/.test(s))
+        .filter((s: string) => !RE_TYPE_SPEC.test(s))
         .map((s: string) => s.trim())
         .filter(Boolean);
       if (kept.length === 0) return "";
-      const fixed = kept.join(", ").replace(/(\w+)\s+as\s+(\w+)/g, "$1: $2");
+      const fixed = kept.join(", ").replace(RE_AS_RENAME, "$1: $2");
       return `const {${fixed}} = require("${src}");`;
     },
   );
   // strip TS type-only exports
+  out = out.replace(RE_TYPE_EXPORT_FROM, "");
+  out = out.replace(RE_TYPE_EXPORT, "");
+  out = out.replace(RE_IMPORT_STAR, 'const $1 = require("$2");');
   out = out.replace(
-    /export\s+type\s+\{[^}]*\}\s+from\s+['"][^'"]+['"]\s*;?/g,
-    "",
-  );
-  out = out.replace(
-    /export\s+type\s+\{[^}]*\}\s*;?/g,
-    "",
-  );
-  out = out.replace(
-    /import\s+\*\s+as\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?/g,
-    'const $1 = require("$2");',
-  );
-  out = out.replace(
-    /import\s+(\w+)\s*,\s*\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?/g,
+    RE_IMPORT_DEFAULT_NAMED,
     (_m, def, named, src) => {
       const tmp = `__import_${def}`;
-      const fixed = named.replace(/(\w+)\s+as\s+(\w+)/g, "$1: $2");
+      const fixed = named.replace(RE_AS_RENAME, "$1: $2");
       return `const ${tmp} = require("${src}"); const ${def} = ${tmp}.__esModule ? ${tmp}.default : ${tmp}; const {${fixed}} = ${tmp};`;
     },
   );
+  out = out.replace(RE_IMPORT_DEFAULT, 'const $1 = require("$2");');
   out = out.replace(
-    /import\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?/g,
-    'const $1 = require("$2");',
-  );
-  out = out.replace(
-    /import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?/g,
+    RE_IMPORT_NAMED,
     (_m, specs, src) => {
-      const fixed = specs.replace(/(\w+)\s+as\s+(\w+)/g, "$1: $2");
+      const fixed = specs.replace(RE_AS_RENAME, "$1: $2");
       return `const {${fixed}} = require("${src}");`;
     },
   );
-  out = out.replace(
-    /import\s+['"]([^'"]+)['"]\s*;?/g,
-    'require("$1");',
-  );
+  out = out.replace(RE_IMPORT_SIDE_EFFECT, 'require("$1");');
   // export default
-  out = out.replace(
-    /export\s+default\s+class\s+(\w+)/g,
-    "module.exports = class $1",
-  );
-  out = out.replace(
-    /export\s+default\s+function\s+(\w+)/g,
-    "module.exports = function $1",
-  );
-  out = out.replace(
-    /export\s+default\s+function\s*\(/g,
-    "module.exports = function(",
-  );
-  out = out.replace(/export\s+default\s+/g, "module.exports = ");
+  out = out.replace(RE_EXPORT_DEFAULT_CLASS, "module.exports = class $1");
+  out = out.replace(RE_EXPORT_DEFAULT_FN_NAMED, "module.exports = function $1");
+  out = out.replace(RE_EXPORT_DEFAULT_FN_ANON, "module.exports = function(");
+  out = out.replace(RE_EXPORT_DEFAULT, "module.exports = ");
   // re-exports
+  out = out.replace(RE_EXPORT_STAR, 'Object.assign(exports, require("$1"));');
   out = out.replace(
-    /export\s+\*\s+from\s+['"]([^'"]+)['"]\s*;?/g,
-    'Object.assign(exports, require("$1"));',
-  );
-  out = out.replace(
-    /export\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?/g,
+    RE_EXPORT_NAMED_FROM,
     (_m, specs, src) => {
       const binds = specs
         .split(",")
         .map((s: string) => {
-          const parts = s.trim().split(/\s+as\s+/);
+          const parts = s.trim().split(RE_AS_SPLIT);
           const local = parts[0].trim();
           const exported = parts.length > 1 ? parts[1].trim() : local;
           return `exports.${exported} = require("${src}").${local}`;
@@ -535,12 +520,12 @@ function esmToCjsViaRegex(code: string): string {
     },
   );
   out = out.replace(
-    /export\s+\{([^}]+)\}\s*;?/g,
+    RE_EXPORT_NAMED,
     (_m, specs) => {
       const binds = specs
         .split(",")
         .map((s: string) => {
-          const parts = s.trim().split(/\s+as\s+/);
+          const parts = s.trim().split(RE_AS_SPLIT);
           const local = parts[0].trim();
           const exported = parts.length > 1 ? parts[1].trim() : local;
           return `exports.${exported} = ${local}`;
@@ -550,12 +535,9 @@ function esmToCjsViaRegex(code: string): string {
     },
   );
   // named exports
-  out = out.replace(
-    /export\s+async\s+function\s+(\w+)/g,
-    "exports.$1 = async function $1",
-  );
-  out = out.replace(/export\s+function\s+(\w+)/g, "exports.$1 = function $1");
-  out = out.replace(/export\s+class\s+(\w+)/g, "exports.$1 = class $1");
-  out = out.replace(/export\s+(?:const|let|var)\s+(\w+)\s*=/g, "exports.$1 =");
+  out = out.replace(RE_EXPORT_ASYNC_FN, "exports.$1 = async function $1");
+  out = out.replace(RE_EXPORT_FN, "exports.$1 = function $1");
+  out = out.replace(RE_EXPORT_CLASS, "exports.$1 = class $1");
+  out = out.replace(RE_EXPORT_VAR, "exports.$1 =");
   return out;
 }
