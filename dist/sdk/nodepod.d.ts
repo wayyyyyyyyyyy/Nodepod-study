@@ -14,6 +14,7 @@ export declare class Nodepod {
     private _packages;
     private _proxy;
     private _cwd;
+    private _baseEnv;
     private _processManager;
     private _vfsBridge;
     private _sharedVFS;

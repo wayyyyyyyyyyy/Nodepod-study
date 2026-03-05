@@ -1,7 +1,7 @@
 var __defProp = Object.defineProperty;
 var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
 var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
-import { n as normalize, b as basename, d as dirname, L as LS_BLOCK_SIZE, Y as YES_REPEAT_COUNT, e as extname, N as NPM_REGISTRY_URL_SLASH, V as VERSIONS, r as resolve, a as relative, c as createHash, D as DEFAULT_ENV, E as EventEmitter, M as MOCK_PID, W as Writable, R as Readable, S as ScriptEngine, f as format, g as getAllServers, h as ref, u as unref, i as addDrainListener, T as TIMEOUTS, j as closeAllServers, k as resetRefCount, B as Buffer2, l as getActiveContext, m as getRefCount, o as resetActiveInterfaceCount, __tla as __tla_0 } from "./index-Ale2oba_.js";
+import { n as normalize, b as basename, d as dirname, L as LS_BLOCK_SIZE, Y as YES_REPEAT_COUNT, e as extname, N as NPM_REGISTRY_URL_SLASH, V as VERSIONS, r as resolve, a as relative, c as createHash, D as DEFAULT_ENV, E as EventEmitter, M as MOCK_PID, W as Writable, R as Readable, S as ScriptEngine, f as format, g as getAllServers, h as ref, u as unref, i as addDrainListener, T as TIMEOUTS, j as closeAllServers, k as resetRefCount, B as Buffer2, l as getActiveContext, m as getRefCount, o as getActiveInterfaceCount, p as resetActiveInterfaceCount, __tla as __tla_0 } from "./index-D0LLK7Fn.js";
 let ShellProcess, clearStreamingCallbacks, child_process, exec, execFile, execFileSync, execSync, executeNodeBinary, fork, getShellCwd, handleIPCFromParent, initShellExec, isStdinRaw, sendStdin, setForkChildCallback, setIPCReceiveHandler, setIPCSend, setShellCwd, setSpawnChildCallback, setStreamingCallbacks, setSyncChannel, shellExec, spawn, spawnSync;
 let __tla = Promise.all([
   (() => {
@@ -6757,10 +6757,10 @@ ${A_DIM}Done in ${elapsed}s${A_RESET}`;
     }
   }
   async function installPackages(args, ctx, pm = "npm") {
-    const { DependencyInstaller } = await import("./index-Ale2oba_.js").then(async (m) => {
+    const { DependencyInstaller } = await import("./index-D0LLK7Fn.js").then(async (m) => {
       await m.__tla;
       return m;
-    }).then((n) => n.ad);
+    }).then((n) => n.ae);
     const installer = new DependencyInstaller(_vol, {
       cwd: ctx.cwd
     });
@@ -6866,10 +6866,10 @@ ${A_DIM}Done in ${elapsed}s${A_RESET}`;
     };
   }
   async function listPackages(ctx, pm = "npm") {
-    const { DependencyInstaller } = await import("./index-Ale2oba_.js").then(async (m) => {
+    const { DependencyInstaller } = await import("./index-D0LLK7Fn.js").then(async (m) => {
       await m.__tla;
       return m;
-    }).then((n) => n.ad);
+    }).then((n) => n.ae);
     const installer = new DependencyInstaller(_vol, {
       cwd: ctx.cwd
     });
@@ -7025,10 +7025,10 @@ ${JSON.stringify(pkg, null, 2)}
       }
     }
     try {
-      const { RegistryClient } = await import("./index-Ale2oba_.js").then(async (m) => {
+      const { RegistryClient } = await import("./index-D0LLK7Fn.js").then(async (m) => {
         await m.__tla;
         return m;
-      }).then((n) => n.as);
+      }).then((n) => n.at);
       const client = new RegistryClient();
       const meta = await client.fetchManifest(name);
       const latest = (_a = meta["dist-tags"]) == null ? void 0 : _a.latest;
@@ -7134,6 +7134,7 @@ ${JSON.stringify(pkg, null, 2)}
     };
   }
   executeNodeBinary = async function(filePath, args, ctx, opts) {
+    var _a;
     if (!_vol) return {
       stdout: "",
       stderr: "Volume unavailable\n",
@@ -7335,8 +7336,15 @@ ${errStack}` : errStack || errMsg;
     }
     await new Promise((r) => setTimeout(r, 0));
     const shouldStayAlive = () => {
+      var _a2, _b, _c, _d, _e;
       if (!tlaSettled) return true;
       if (getRefCount() > 0) return true;
+      if (myHaltSignal) {
+        if (getActiveInterfaceCount() > 0) return true;
+        if ((_a2 = proc.stdin) == null ? void 0 : _a2.isRaw) return true;
+        if (((_c = (_b = proc.stdin).listenerCount) == null ? void 0 : _c.call(_b, "data")) > 0) return true;
+        if (((_e = (_d = proc.stdin).listenerCount) == null ? void 0 : _e.call(_d, "keypress")) > 0) return true;
+      }
       if (getAllServers().size > 0) return true;
       return false;
     };
@@ -7349,6 +7357,7 @@ ${errStack}` : errStack || errMsg;
       };
     }
     const handledErrors = /* @__PURE__ */ new WeakSet();
+    const disableInteractiveIdleExit = myHaltSignal && ((_a = proc.env) == null ? void 0 : _a.NODEPOD_NO_INTERACTIVE_TIMEOUT) === "1";
     const rejHandler = (ev) => {
       ev.preventDefault();
       const r = ev.reason;
@@ -7431,6 +7440,10 @@ ${r.stack ?? ""}
           if (didExit || (myHaltSignal == null ? void 0 : myHaltSignal.aborted)) break;
           if (shouldStayAlive()) {
             everNonEmpty = true;
+            consecutiveEmpty = 0;
+            continue;
+          }
+          if (disableInteractiveIdleExit) {
             consecutiveEmpty = 0;
             continue;
           }

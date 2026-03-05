@@ -35,6 +35,6 @@ export interface VolumeSnapshot {
 }
 export interface VolumeEntry {
     path: string;
-    kind: 'file' | 'directory';
+    kind: 'file' | 'directory' | 'symlink';
     data?: string;
 }

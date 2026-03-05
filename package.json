@@ -49,6 +49,7 @@
   ],
   "sideEffects": false,
   "scripts": {
+    "dev:demo": "vite --config vite.demo.config.ts",
     "build:lib": "vite build --config vite.lib.config.js && node -e \"require('fs').copyFileSync('static/__sw__.js','dist/__sw__.js')\"",
     "build:types": "tsc --project tsconfig.build.json",
     "build:publish": "npm run build:lib && npm run build:types",

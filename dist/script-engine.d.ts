@@ -43,6 +43,7 @@ export declare class ScriptEngine {
     private transformCache;
     constructor(vol: MemoryVolume, opts?: EngineOptions);
     private patchTextDecoder;
+    private patchFetchProxy;
     private patchStackTraceApi;
     execute(code: string, filename?: string): {
         exports: unknown;

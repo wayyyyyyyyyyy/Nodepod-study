@@ -40,6 +40,7 @@ export declare class NodepodTerminal {
     setCwd(cwd: string): void;
     getCwd(): string;
     get xterm(): any;
+    private _stripBracketedPasteMarkers;
     private _handleInput;
     private _historyUp;
     private _historyDown;

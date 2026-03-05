@@ -35,13 +35,27 @@ const RE_EXPORT_VAR = /export\s+(?:const|let|var)\s+(\w+)\s*=/g;
 const RE_AS_RENAME = /(\w+)\s+as\s+(\w+)/g;
 const RE_TYPE_SPEC = /^\s*type\s+\w+/;
 const RE_AS_SPLIT = /\s+as\s+/;
+const RE_IMPORT_EXPORT_WITH_FROM_ATTR =
+  /((?:^|[\n\r])\s*(?:import|export)[\s\S]*?\bfrom\s*['"][^'"]+['"])\s+(?:with|assert)\s*\{[\s\S]*?\}(\s*;?)/gm;
+const RE_SIDE_EFFECT_IMPORT_ATTR =
+  /((?:^|[\n\r])\s*import\s*['"][^'"]+['"])\s+(?:with|assert)\s*\{[\s\S]*?\}(\s*;?)/gm;
 
 export function esmToCjs(code: string): string {
+  code = stripImportAttributes(code);
   try {
     return esmToCjsViaAst(code);
   } catch {
     return esmToCjsViaRegex(code);
   }
+}
+
+// Normalize stage-3 import attributes so older parsers/transforms can proceed.
+// Example: `import data from "./x.json" with { type: "json" }`.
+export function stripImportAttributes(code: string): string {
+  let out = code;
+  out = out.replace(RE_IMPORT_EXPORT_WITH_FROM_ATTR, "$1$2");
+  out = out.replace(RE_SIDE_EFFECT_IMPORT_ATTR, "$1$2");
+  return out;
 }
 
 // collect ESM→CJS patches from a pre-parsed AST, pushes into the patches array

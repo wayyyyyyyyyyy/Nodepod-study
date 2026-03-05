@@ -214,8 +214,18 @@ export class NodepodTerminal {
 
   /* ---- Input handling ---- */
 
+  private _stripBracketedPasteMarkers(data: string): string {
+    // xterm bracketed-paste delimiters: ESC[200~ ... ESC[201~
+    // If unhandled, they leak as "00~"/"01~" in line-edit mode.
+    return data
+      .replace(/\x1b\[200~/g, "")
+      .replace(/\x1b\[201~/g, "");
+  }
+
   private _handleInput(data: string): void {
     if (!this._term) return;
+    data = this._stripBracketedPasteMarkers(data);
+    if (!data) return;
 
     if (this._running) {
       // Ctrl+C

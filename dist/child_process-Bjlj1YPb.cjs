@@ -2,7 +2,7 @@
 
 Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
 
-const index = require('./index-BO1i013L.cjs');
+const index = require('./index-BR7ErQGy.cjs');
 
 function expandVariables(raw, env, lastExit) {
   let result = "";
@@ -6091,7 +6091,7 @@ function formatWarn(msg, pm) {
   }
 }
 async function installPackages(args, ctx, pm = "npm") {
-  const { DependencyInstaller } = await Promise.resolve().then(() => require('./index-BO1i013L.cjs')).then(n => n.installer);
+  const { DependencyInstaller } = await Promise.resolve().then(() => require('./index-BR7ErQGy.cjs')).then(n => n.installer);
   const installer = new DependencyInstaller(_vol, { cwd: ctx.cwd });
   let out = "";
   const write = _stdoutSink ?? ((_s) => {
@@ -6188,7 +6188,7 @@ async function uninstallPackages(args, ctx, pm = "npm") {
   return { stdout: out, stderr: "", exitCode: 0 };
 }
 async function listPackages(ctx, pm = "npm") {
-  const { DependencyInstaller } = await Promise.resolve().then(() => require('./index-BO1i013L.cjs')).then(n => n.installer);
+  const { DependencyInstaller } = await Promise.resolve().then(() => require('./index-BR7ErQGy.cjs')).then(n => n.installer);
   const installer = new DependencyInstaller(_vol, { cwd: ctx.cwd });
   const pkgs = installer.listInstalled();
   const entries = Object.entries(pkgs);
@@ -6325,7 +6325,7 @@ async function npmInfo(args, ctx) {
     }
   }
   try {
-    const { RegistryClient } = await Promise.resolve().then(() => require('./index-BO1i013L.cjs')).then(n => n.registryClient);
+    const { RegistryClient } = await Promise.resolve().then(() => require('./index-BR7ErQGy.cjs')).then(n => n.registryClient);
     const client = new RegistryClient();
     const meta = await client.fetchManifest(name);
     const latest = meta["dist-tags"]?.latest;
@@ -6587,6 +6587,12 @@ ${errStack}` : errStack || errMsg;
   const shouldStayAlive = () => {
     if (!tlaSettled) return true;
     if (index.getRefCount() > 0) return true;
+    if (myHaltSignal) {
+      if (index.getActiveInterfaceCount() > 0) return true;
+      if (proc.stdin?.isRaw) return true;
+      if (proc.stdin.listenerCount?.("data") > 0) return true;
+      if (proc.stdin.listenerCount?.("keypress") > 0) return true;
+    }
     if (index.getAllServers().size > 0) return true;
     return false;
   };
@@ -6595,6 +6601,7 @@ ${errStack}` : errStack || errMsg;
     return { stdout: out, stderr: err, exitCode: 0 };
   }
   const handledErrors = /* @__PURE__ */ new WeakSet();
+  const disableInteractiveIdleExit = myHaltSignal && proc.env?.NODEPOD_NO_INTERACTIVE_TIMEOUT === "1";
   const rejHandler = (ev) => {
     ev.preventDefault();
     const r = ev.reason;
@@ -6675,6 +6682,10 @@ ${r.stack ?? ""}
         if (didExit || myHaltSignal?.aborted) break;
         if (shouldStayAlive()) {
           everNonEmpty = true;
+          consecutiveEmpty = 0;
+          continue;
+        }
+        if (disableInteractiveIdleExit) {
           consecutiveEmpty = 0;
           continue;
         }
@@ -7431,4 +7442,4 @@ exports.setSyncChannel = setSyncChannel;
 exports.shellExec = shellExec;
 exports.spawn = spawn;
 exports.spawnSync = spawnSync;
-//# sourceMappingURL=child_process-hmVqFcF7.cjs.map
+//# sourceMappingURL=child_process-Bjlj1YPb.cjs.map

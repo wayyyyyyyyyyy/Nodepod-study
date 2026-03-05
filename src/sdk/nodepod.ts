@@ -34,6 +34,7 @@ export class Nodepod {
   private _packages: DependencyInstaller;
   private _proxy: RequestProxy;
   private _cwd: string;
+  private _baseEnv: Record<string, string>;
 
   private _processManager: ProcessManager;
   private _vfsBridge: VFSBridge;
@@ -49,12 +50,14 @@ export class Nodepod {
     packages: DependencyInstaller,
     proxy: RequestProxy,
     cwd: string,
+    baseEnv: Record<string, string>,
   ) {
     this._volume = volume;
     this._engine = engine;
     this._packages = packages;
     this._proxy = proxy;
     this._cwd = cwd;
+    this._baseEnv = { ...baseEnv };
     this.fs = new NodepodFS(volume);
     this._processManager = new ProcessManager(volume);
     this._vfsBridge = new VFSBridge(volume);
@@ -135,7 +138,14 @@ export class Nodepod {
       onServerReady: opts.onServerReady,
     });
 
-    const nodepod = new Nodepod(volume, engine, packages, proxy, cwd);
+    const nodepod = new Nodepod(
+      volume,
+      engine,
+      packages,
+      proxy,
+      cwd,
+      opts.env ?? {},
+    );
 
     if (opts.files) {
       for (const [path, content] of Object.entries(opts.files)) {
@@ -189,12 +199,13 @@ export class Nodepod {
   ): Promise<NodepodProcess> {
     const proc = new NodepodProcess();
     const execCwd = opts?.cwd ?? this._cwd;
+    const mergedEnv = { ...this._baseEnv, ...(opts?.env ?? {}) };
 
     const handle = this._processManager.spawn({
       command: cmd,
       args: args ?? [],
       cwd: execCwd,
-      env: opts?.env ?? {},
+      env: mergedEnv,
     });
 
     handle.on("stdout", (data: string) => {
@@ -241,7 +252,7 @@ export class Nodepod {
         filePath,
         args: args ?? [],
         cwd: execCwd,
-        env: opts?.env,
+        env: mergedEnv,
         isShell: false,
       });
     } else {
@@ -251,7 +262,7 @@ export class Nodepod {
         filePath: "",
         args: args ?? [],
         cwd: execCwd,
-        env: opts?.env,
+        env: mergedEnv,
         isShell: true,
         shellCommand: fullCmd,
       });
@@ -294,7 +305,7 @@ export class Nodepod {
         command: "shell",
         args: [],
         cwd: this._cwd,
-        env: {},
+        env: this._baseEnv,
       });
       shellReady = new Promise<void>((resolve) => {
         if (shellHandle!.state === "running") {
@@ -337,6 +348,12 @@ export class Nodepod {
             terminal.write("\r\n");
           }
         }
+        function restoreInteractiveTerminalState() {
+          if (!isStdinRaw) return;
+          // Force-normalize terminal when a TUI exits unexpectedly.
+          terminal.write("\x1b[0m\x1b[?25h\x1b[?1049l");
+          isStdinRaw = false;
+        }
 
         // Ensure persistent shell worker is running
         await ensureShellWorker();
@@ -374,6 +391,7 @@ export class Nodepod {
           filePath: "",
           args: [],
           cwd: this._cwd,
+          env: this._baseEnv,
           isShell: true,
           shellCommand: cmd,
           persistent: true,
@@ -408,6 +426,7 @@ export class Nodepod {
             if (activeAbort === myAbort) activeAbort = null;
 
             if (!aborted && !isStale) {
+              restoreInteractiveTerminalState();
               if (!wroteNewline) terminal.write("\r\n");
               terminal._setRunning(false);
               terminal._writePrompt();
@@ -429,6 +448,7 @@ export class Nodepod {
             }
             if (activeAbort === myAbort) activeAbort = null;
             if (!aborted && !isStale) {
+              restoreInteractiveTerminalState();
               if (!wroteNewline) terminal.write("\r\n");
               terminal._setRunning(false);
               terminal._writePrompt();

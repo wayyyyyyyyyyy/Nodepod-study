@@ -3,6 +3,7 @@ import {
   esmToCjs,
   hasTopLevelAwait,
   stripTopLevelAwait,
+  stripImportAttributes,
 } from "../syntax-transforms";
 
 describe("esmToCjs", () => {
@@ -29,6 +30,22 @@ describe("esmToCjs", () => {
     it("converts side-effect-only import", () => {
       const result = esmToCjs('import "polyfill";');
       expect(result).toContain('require("polyfill")');
+    });
+
+    it("converts import with assert attributes", () => {
+      const result = esmToCjs(
+        'import data from "./x.json" assert { type: "json" };',
+      );
+      expect(result).toContain('require("./x.json")');
+      expect(result).not.toContain("assert {");
+    });
+
+    it("converts import with with-attributes", () => {
+      const result = esmToCjs(
+        'import data from "./x.json" with { type: "json" };',
+      );
+      expect(result).toContain('require("./x.json")');
+      expect(result).not.toContain("with {");
     });
 
     it("converts aliased named imports", () => {
@@ -154,5 +171,21 @@ describe("stripTopLevelAwait", () => {
   it("returns input unchanged when no await present", () => {
     const code = "const x = 1 + 2;";
     expect(stripTopLevelAwait(code)).toBe(code);
+  });
+});
+
+describe("stripImportAttributes", () => {
+  it("strips assert attributes from static import", () => {
+    const code = 'import cfg from "./cfg.json" assert { type: "json" };';
+    expect(stripImportAttributes(code)).toBe(
+      'import cfg from "./cfg.json";',
+    );
+  });
+
+  it("strips with attributes from static import", () => {
+    const code = 'import cfg from "./cfg.json" with { type: "json" };';
+    expect(stripImportAttributes(code)).toBe(
+      'import cfg from "./cfg.json";',
+    );
   });
 });

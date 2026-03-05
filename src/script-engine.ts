@@ -120,6 +120,7 @@ import {
   collectEsmCjsPatches,
   hasTopLevelAwait,
   stripTopLevelAwait,
+  stripImportAttributes,
 } from "./syntax-transforms";
 import { getCachedModule, precompileWasm, compileWasmInWorker } from "./helpers/wasm-cache";
 import * as acorn from "acorn";
@@ -295,12 +296,13 @@ function rewriteDynamicImportsRegex(source: string): string {
 
 // ── ESM → CJS conversion ──
 function convertModuleSyntax(source: string, filePath: string): string {
-  if (!/\bimport\b|\bexport\b/.test(source)) return source;
+  const normalized = stripImportAttributes(source);
+  if (!/\bimport\b|\bexport\b/.test(normalized)) return normalized;
   try {
-    return convertViaAst(source, filePath);
+    return convertViaAst(normalized, filePath);
   } catch (astErr) {
     _nativeConsole.warn("[convertModuleSyntax] AST parse failed for", filePath, "falling back to regex:", astErr instanceof Error ? astErr.message : String(astErr));
-    return convertViaRegex(source, filePath);
+    return convertViaRegex(normalized, filePath);
   }
 }
 
@@ -2086,31 +2088,67 @@ function buildResolver(
       return cached;
     }
 
+    const expandCompatCandidates = (base: string): string[] => {
+      // Prefer CJS internals when both ESM and CJS trees exist.
+      // Some SDK ESM internals use syntax not yet supported by our parser chain.
+      const markers = [
+        "/node_modules/@anthropic-ai/sdk/internal/",
+        "/node_modules/openai/internal/",
+      ];
+      for (const marker of markers) {
+        if (base.includes(marker)) {
+          const pkgRoot = base.slice(0, base.indexOf(marker) + marker.length - "/internal/".length);
+          const rel = base.slice(base.indexOf(marker) + marker.length);
+          const relNoExt = rel.replace(/\.(mjs|cjs|js)$/, "");
+          const extVariants = ["js", "mjs", "cjs"];
+          const candidates = [
+            `${pkgRoot}/lib/internal/${rel}`,
+            `${pkgRoot}/lib/${rel}`,
+            `${pkgRoot}/${rel}`,
+            ...extVariants.map((ext) => `${pkgRoot}/lib/internal/${relNoExt}.${ext}`),
+            ...extVariants.map((ext) => `${pkgRoot}/lib/${relNoExt}.${ext}`),
+            ...extVariants.map((ext) => `${pkgRoot}/${relNoExt}.${ext}`),
+          ];
+          const uniq = Array.from(new Set([...candidates, base]));
+          return uniq;
+        }
+      }
+      return [base];
+    };
+
     const tryFile = (base: string): string | null => {
-      if (vol.existsSync(base)) {
-        const s = vol.statSync(base);
-        if (s.isFile()) return base;
-        const localMf = readManifest(pathPolyfill.join(base, "package.json"));
-        if (localMf?.main) {
-          const mainPath = pathPolyfill.join(base, localMf.main);
-          if (vol.existsSync(mainPath)) {
-            const ms = vol.statSync(mainPath);
-            if (ms.isFile()) return mainPath;
+      const candidates = expandCompatCandidates(base);
+
+      for (const candidate of candidates) {
+        if (vol.existsSync(candidate)) {
+          const s = vol.statSync(candidate);
+          if (s.isFile()) return candidate;
+          const localMf = readManifest(pathPolyfill.join(candidate, "package.json"));
+          if (localMf?.main) {
+            const mainPath = pathPolyfill.join(candidate, localMf.main);
+            if (vol.existsSync(mainPath)) {
+              const ms = vol.statSync(mainPath);
+              if (ms.isFile()) return mainPath;
+            }
+            for (const ext of MAIN_FIELD_EXTENSIONS) {
+              const withExt = mainPath + ext;
+              if (vol.existsSync(withExt)) return withExt;
+            }
           }
-          for (const ext of MAIN_FIELD_EXTENSIONS) {
-            const withExt = mainPath + ext;
-            if (vol.existsSync(withExt)) return withExt;
+          for (const idx of INDEX_FILES) {
+            const idxPath = pathPolyfill.join(candidate, idx);
+            if (vol.existsSync(idxPath)) return idxPath;
           }
         }
-        for (const idx of INDEX_FILES) {
-          const idxPath = pathPolyfill.join(base, idx);
-          if (vol.existsSync(idxPath)) return idxPath;
+      }
+
+      for (const candidate of candidates) {
+        for (const ext of [...MAIN_FIELD_EXTENSIONS, ".node"]) {
+          const withExt = candidate + ext;
+          if (vol.existsSync(withExt)) return withExt;
         }
       }
-      for (const ext of [...MAIN_FIELD_EXTENSIONS, ".node"]) {
-        const withExt = base + ext;
-        if (vol.existsSync(withExt)) return withExt;
-      }
+
       return null;
     };
 
@@ -2644,6 +2682,27 @@ function buildResolver(
     if (CORE_MODULES[resolved]) return CORE_MODULES[resolved];
 
     const rec = loadModule(resolved, resolver._ownerRecord);
+    if (id === "signal-exit") {
+      const ex: any = rec.exports;
+      if (typeof ex !== "function" && ex && typeof ex === "object") {
+        const candidate =
+          typeof ex.onExit === "function"
+            ? ex.onExit
+            : typeof ex.default === "function"
+              ? ex.default
+              : null;
+        if (candidate) {
+          const fn: any = (...args: any[]) => candidate(...args);
+          Object.assign(fn, ex);
+          if (typeof fn.onExit !== "function") fn.onExit = candidate;
+          if (typeof fn.default !== "function") fn.default = candidate;
+          rec.exports = fn;
+        }
+      } else if (typeof ex === "function") {
+        if (typeof (ex as any).onExit !== "function") (ex as any).onExit = ex;
+        if (typeof (ex as any).default !== "function") (ex as any).default = ex;
+      }
+    }
     // Proxy for async WASM — reads from rec.exports at access time so
     // reassigned module.exports is picked up after compilation finishes
     if ((rec as any).__wasmReady) {
@@ -2742,6 +2801,7 @@ export class ScriptEngine {
       ) => setTimeout(fn, 0, ...a);
       (globalThis as any).clearImmediate = (id: number) => clearTimeout(id);
     }
+    this.patchFetchProxy();
 
     // Browsers disallow sync WebAssembly.Module() for >8MB buffers — serve from cache
     if (
@@ -2887,6 +2947,58 @@ export class ScriptEngine {
     }
 
     globalThis.TextDecoder = ExtendedDecoder as unknown as typeof TextDecoder;
+  }
+
+  private patchFetchProxy(): void {
+    const envProxy = this.opts.env?.NODEPOD_CORS_PROXY_URL;
+    if (typeof envProxy === "string" && envProxy.trim()) {
+      let normalized = envProxy.trim();
+      if (
+        typeof location !== "undefined" &&
+        !/^https?:\/\//i.test(normalized)
+      ) {
+        normalized = new URL(normalized, location.origin).toString();
+      }
+      if (!normalized.endsWith("/")) normalized += "/";
+      (globalThis as any).__nodepodCorsProxyUrl = normalized;
+    } else if ((globalThis as any).__nodepodCorsProxyUrl === undefined) {
+      (globalThis as any).__nodepodCorsProxyUrl = null;
+    }
+
+    const g = globalThis as any;
+    if (typeof g.fetch !== "function") return;
+    if (g.fetch.__nodepodCorsPatched) return;
+
+    const nativeFetch = g.fetch.bind(globalThis);
+    const patchedFetch = (input: RequestInfo | URL, init?: RequestInit) => {
+      const proxyBase = (globalThis as any).__nodepodCorsProxyUrl as
+        | string
+        | null
+        | undefined;
+      if (!proxyBase) return nativeFetch(input as any, init);
+
+      let url: string | null = null;
+      if (typeof input === "string") url = input;
+      else if (input instanceof URL) url = input.toString();
+
+      if (!url || !/^https?:\/\//i.test(url)) {
+        return nativeFetch(input as any, init);
+      }
+
+      if (typeof location !== "undefined") {
+        const ownOrigin = `${location.protocol}//${location.host}`;
+        if (url.startsWith(ownOrigin)) {
+          return nativeFetch(input as any, init);
+        }
+      }
+
+      return nativeFetch(proxyBase + encodeURIComponent(url), init);
+    };
+
+    g.fetch = Object.assign(patchedFetch, {
+      __nodepodCorsPatched: true,
+      __nodepodNativeFetch: nativeFetch,
+    });
   }
 
   // Override even in Chrome — eval produces stack frames the native V8 API can't map to VFS paths

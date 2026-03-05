@@ -34,8 +34,12 @@ export declare class RequestProxy extends EventEmitter {
     private _processManager;
     private _workerWsConns;
     private _previewScript;
+    private _onProcessWsFrame;
+    private _onSwControllerChange;
+    private _onSwMessageEvent;
     constructor(opts?: ProxyOptions);
     setProcessManager(pm: any): void;
+    dispose(): void;
     register(server: Server | IVirtualServer, port: number, hostname?: string): void;
     unregister(port: number): void;
     setPreviewScript(script: string | null): void;

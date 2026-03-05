@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nodepod CLI Terminal Demo</title>
+    <link rel="stylesheet" href="/demo/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <section class="card">
+        <h1>Browser Terminal for `pi-momo` CLI</h1>
+        <p class="sub">
+          Boot Nodepod runtime, then run `pi-momo` from this browser terminal.
+        </p>
+
+        <div class="row">
+          <button id="boot-btn">1) Boot Runtime</button>
+          <button id="install-btn" disabled>2) Install pi-momo</button>
+          <span id="status" class="status">Idle</span>
+        </div>
+
+        <label for="cmd-input">Command to run</label>
+        <div class="row">
+          <input id="cmd-input" class="cmd-input" value="npx pi-momo --help" />
+          <button id="run-btn" disabled>Run Command</button>
+        </div>
+
+        <div class="row">
+          <button id="clear-btn" disabled>Clear Terminal</button>
+          <span class="hint">You can type directly in terminal too.</span>
+        </div>
+
+        <div id="terminal" class="terminal"></div>
+      </section>
+    </main>
+
+    <script type="module" src="/demo/main.ts"></script>
+  </body>
+</html>

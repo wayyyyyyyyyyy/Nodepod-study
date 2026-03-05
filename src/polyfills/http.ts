@@ -706,10 +706,33 @@ export const METHODS = [
 // CORS proxy helper
 
 function fetchProxy(): string | null {
+  const globalProxy = (globalThis as any).__nodepodCorsProxyUrl;
+  if (typeof globalProxy === "string" && globalProxy.trim()) {
+    let normalized = globalProxy.trim();
+    if (
+      typeof location !== "undefined" &&
+      !/^https?:\/\//i.test(normalized)
+    ) {
+      normalized = new URL(normalized, location.origin).toString();
+    }
+    if (!normalized.endsWith("/")) normalized += "/";
+    return normalized;
+  }
   try {
-    return typeof localStorage !== "undefined"
-      ? (localStorage.getItem("__corsProxyUrl") ?? null)
-      : null;
+    const lsProxy =
+      typeof localStorage !== "undefined"
+        ? (localStorage.getItem("__corsProxyUrl") ?? null)
+        : null;
+    if (!lsProxy) return null;
+    let normalized = lsProxy.trim();
+    if (
+      typeof location !== "undefined" &&
+      !/^https?:\/\//i.test(normalized)
+    ) {
+      normalized = new URL(normalized, location.origin).toString();
+    }
+    if (!normalized.endsWith("/")) normalized += "/";
+    return normalized;
   } catch {
     return null;
   }

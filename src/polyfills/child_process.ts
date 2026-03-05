@@ -9,7 +9,7 @@ import { Buffer } from "./buffer";
 import type { MemoryVolume } from "../memory-volume";
 import { ScriptEngine } from "../script-engine";
 import type { PackageManifest } from "../types/manifest";
-import { resetActiveInterfaceCount } from "./readline";
+import { getActiveInterfaceCount, resetActiveInterfaceCount } from "./readline";
 import { ref, unref, getRefCount, resetRefCount, addDrainListener } from "../helpers/event-loop";
 import { getActiveContext, setActiveContext } from "../threading/process-context";
 import type { ProcessContext } from "../threading/process-context";
@@ -1227,6 +1227,14 @@ export async function executeNodeBinary(
   const shouldStayAlive = (): boolean => {
     if (!tlaSettled) return true;
     if (getRefCount() > 0) return true;
+    if (myHaltSignal) {
+      if (getActiveInterfaceCount() > 0) return true;
+      // Interactive TUIs (Ink/Blessed/Clack/etc.) often only keep stdin
+      // listeners and raw mode active, without creating timers/servers.
+      if ((proc.stdin as any)?.isRaw) return true;
+      if (proc.stdin.listenerCount?.("data") > 0) return true;
+      if (proc.stdin.listenerCount?.("keypress") > 0) return true;
+    }
     if (getAllServers().size > 0) return true;
     return false;
   };
@@ -1239,6 +1247,11 @@ export async function executeNodeBinary(
 
   // avoid duplicate output when same error fires as both 'error' and 'unhandledrejection'
   const handledErrors = new WeakSet<object>();
+  // Opt-in escape hatch for long-running interactive TUIs in browser runtime.
+  // Some CLIs temporarily drop all detectable handles while awaiting network,
+  // which can look "idle" to the keepalive heuristics.
+  const disableInteractiveIdleExit =
+    myHaltSignal && proc.env?.NODEPOD_NO_INTERACTIVE_TIMEOUT === "1";
 
   const rejHandler = (ev: PromiseRejectionEvent) => {
     ev.preventDefault();
@@ -1341,6 +1354,10 @@ export async function executeNodeBinary(
         if (didExit || myHaltSignal?.aborted) break;
         if (shouldStayAlive()) {
           everNonEmpty = true;
+          consecutiveEmpty = 0;
+          continue;
+        }
+        if (disableInteractiveIdleExit) {
           consecutiveEmpty = 0;
           continue;
         }

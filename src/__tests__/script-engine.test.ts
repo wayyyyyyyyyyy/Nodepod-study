@@ -142,6 +142,116 @@ describe("ScriptEngine", () => {
       expect(result.exports).toEqual({ key: "value" });
     });
 
+    it("prefers @anthropic-ai/sdk lib/internal files when both paths exist", () => {
+      const { engine } = createEngine({
+        "/project/node_modules/@anthropic-ai/sdk/package.json": JSON.stringify({
+          name: "@anthropic-ai/sdk",
+          main: "index.js",
+        }),
+        "/project/node_modules/@anthropic-ai/sdk/index.js":
+          'module.exports = require("./internal/uploads.js");',
+        // Simulate a syntax that fails in the current parser chain.
+        "/project/node_modules/@anthropic-ai/sdk/internal/uploads.js":
+          "module.exports = from node:fs;",
+        "/project/node_modules/@anthropic-ai/sdk/lib/internal/uploads.js":
+          'module.exports = "lib-internal-ok";',
+      });
+
+      const result = engine.execute(
+        'module.exports = require("@anthropic-ai/sdk");',
+        "/project/index.js",
+      );
+      expect(result.exports).toBe("lib-internal-ok");
+    });
+
+    it("prefers openai lib/internal files when both paths exist", () => {
+      const { engine } = createEngine({
+        "/project/node_modules/openai/package.json": JSON.stringify({
+          name: "openai",
+          main: "index.js",
+        }),
+        "/project/node_modules/openai/index.js":
+          'module.exports = require("./internal/uploads.js");',
+        "/project/node_modules/openai/internal/uploads.js":
+          "module.exports = from node:fs;",
+        "/project/node_modules/openai/lib/internal/uploads.js":
+          'module.exports = "openai-lib-internal-ok";',
+      });
+
+      const result = engine.execute(
+        'module.exports = require("openai");',
+        "/project/index.js",
+      );
+      expect(result.exports).toBe("openai-lib-internal-ok");
+    });
+
+    it("falls back to package-root file when sdk internal file is incompatible", () => {
+      const { engine } = createEngine({
+        "/project/node_modules/@anthropic-ai/sdk/package.json": JSON.stringify({
+          name: "@anthropic-ai/sdk",
+          main: "index.js",
+        }),
+        "/project/node_modules/@anthropic-ai/sdk/index.js":
+          'module.exports = require("./internal/uploads.js");',
+        "/project/node_modules/@anthropic-ai/sdk/internal/uploads.js":
+          "module.exports = from node:fs;",
+        "/project/node_modules/@anthropic-ai/sdk/uploads.js":
+          'module.exports = "root-uploads-ok";',
+      });
+
+      const result = engine.execute(
+        'module.exports = require("@anthropic-ai/sdk");',
+        "/project/index.js",
+      );
+      expect(result.exports).toBe("root-uploads-ok");
+    });
+
+    it("falls back to mjs compat file when only mjs variant exists", () => {
+      const { engine } = createEngine({
+        "/project/node_modules/openai/package.json": JSON.stringify({
+          name: "openai",
+          main: "index.js",
+        }),
+        "/project/node_modules/openai/index.js":
+          'module.exports = require("./internal/uploads.js");',
+        "/project/node_modules/openai/internal/uploads.js":
+          "module.exports = from node:fs;",
+        "/project/node_modules/openai/lib/uploads.mjs":
+          'module.exports = "openai-lib-mjs-ok";',
+      });
+
+      const result = engine.execute(
+        'module.exports = require("openai");',
+        "/project/index.js",
+      );
+      expect(result.exports).toBe("openai-lib-mjs-ok");
+    });
+
+    it("adapts signal-exit object exports to callable function", () => {
+      const { engine } = createEngine({
+        "/project/node_modules/signal-exit/package.json": JSON.stringify({
+          name: "signal-exit",
+          main: "index.js",
+        }),
+        "/project/node_modules/signal-exit/index.js": `
+exports.onExit = function onExit() { return "registered"; };
+exports.default = exports.onExit;
+`,
+        "/project/node_modules/proper-lockfile/package.json": JSON.stringify({
+          name: "proper-lockfile",
+          main: "lockfile.js",
+        }),
+        "/project/node_modules/proper-lockfile/lockfile.js":
+          'const onExit = require("signal-exit"); module.exports = onExit();',
+      });
+
+      const result = engine.execute(
+        'module.exports = require("proper-lockfile");',
+        "/project/index.js",
+      );
+      expect(result.exports).toBe("registered");
+    });
+
     it("throws for missing module", () => {
       const { engine } = createEngine();
       expect(() =>
