@@ -416,6 +416,34 @@ describe("MemoryVolume", () => {
       vol.writeFileSync("/test.txt", "data");
       expect(events.length).toBe(0);
     });
+
+    it("watch() fires callback on mkdir/rmdir", () => {
+      const vol = new MemoryVolume();
+      const events: string[] = [];
+      vol.watch("/", {}, (event, filename) => {
+        events.push(`${event}:${filename}`);
+      });
+
+      vol.mkdirSync("/dir");
+      vol.rmdirSync("/dir");
+
+      expect(events).toContain("rename:dir");
+      expect(events.filter((e) => e === "rename:dir").length).toBeGreaterThanOrEqual(2);
+    });
+
+    it("recursive watch receives nested mkdir events", () => {
+      const vol = new MemoryVolume();
+      const events: string[] = [];
+      vol.watch("/", { recursive: true }, (event, filename) => {
+        events.push(`${event}:${filename}`);
+      });
+
+      vol.mkdirSync("/a/b/c", { recursive: true });
+
+      expect(events).toContain("rename:a");
+      expect(events).toContain("rename:a/b");
+      expect(events).toContain("rename:a/b/c");
+    });
   });
 
   describe("createReadStream", () => {

@@ -550,7 +550,29 @@ export class MemoryVolume {
     const norm = this.normalize(p);
 
     if (options?.recursive) {
-      this.ensureDir(norm);
+      if (norm === '/') return;
+
+      let current = this.tree;
+      let currentPath = '';
+      const createdPaths: string[] = [];
+      for (const seg of this.segments(norm)) {
+        currentPath += `/${seg}`;
+        if (!current.children) current.children = new Map();
+        let child = current.children.get(seg);
+        if (!child) {
+          child = { kind: 'directory', children: new Map(), modified: Date.now() };
+          current.children.set(seg, child);
+          createdPaths.push(currentPath);
+        } else if (child.kind !== 'directory') {
+          throw makeSystemError('ENOTDIR', 'mkdir', p);
+        }
+        current = child;
+      }
+
+      for (const createdPath of createdPaths) {
+        this.triggerWatchers(createdPath, 'rename');
+        this.notifyGlobalListeners(createdPath, 'add');
+      }
       return;
     }
 
@@ -568,6 +590,8 @@ export class MemoryVolume {
       children: new Map(),
       modified: Date.now(),
     });
+    this.triggerWatchers(norm, 'rename');
+    this.notifyGlobalListeners(norm, 'add');
   }
 
   readdirSync(p: string): string[] {
@@ -612,6 +636,8 @@ export class MemoryVolume {
     if (target.children!.size > 0) throw makeSystemError('ENOTEMPTY', 'rmdir', p);
 
     parent.children!.delete(name);
+    this.triggerWatchers(norm, 'rename');
+    this.notifyGlobalListeners(norm, 'unlink');
   }
 
   renameSync(from: string, to: string): void {

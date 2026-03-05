@@ -57,6 +57,11 @@ export class RequestProxy extends EventEmitter {
   private _processManager: any | null = null;
   private _workerWsConns = new Map<string, { pid: number }>();
   private _previewScript: string | null = null;
+  private _onProcessWsFrame = (msg: any) => {
+    this._handleWorkerWsFrame(msg);
+  };
+  private _onSwControllerChange: (() => void) | null = null;
+  private _onSwMessageEvent: ((ev: MessageEvent) => void) | null = null;
 
   constructor(opts: ProxyOptions = {}) {
     super();
@@ -71,10 +76,63 @@ export class RequestProxy extends EventEmitter {
   }
 
   setProcessManager(pm: any): void {
+    if (this._processManager?.removeListener) {
+      this._processManager.removeListener("ws-frame", this._onProcessWsFrame);
+    }
     this._processManager = pm;
-    pm.on("ws-frame", (msg: any) => {
-      this._handleWorkerWsFrame(msg);
-    });
+    pm.on("ws-frame", this._onProcessWsFrame);
+  }
+
+  dispose(): void {
+    if (this.heartbeat) {
+      clearInterval(this.heartbeat);
+      this.heartbeat = null;
+    }
+
+    if (this.channel) {
+      try {
+        this.channel.port1.onmessage = null;
+        this.channel.port1.close();
+      } catch {
+        /* ignore */
+      }
+      this.channel = null;
+    }
+
+    if (typeof navigator !== "undefined" && "serviceWorker" in navigator) {
+      if (this._onSwControllerChange) {
+        navigator.serviceWorker.removeEventListener("controllerchange", this._onSwControllerChange);
+      }
+      if (this._onSwMessageEvent) {
+        navigator.serviceWorker.removeEventListener("message", this._onSwMessageEvent);
+      }
+    }
+    this._onSwControllerChange = null;
+    this._onSwMessageEvent = null;
+
+    if (this._processManager?.removeListener) {
+      this._processManager.removeListener("ws-frame", this._onProcessWsFrame);
+    }
+    this._processManager = null;
+
+    if (this._wsBridge) {
+      try {
+        this._wsBridge.close();
+      } catch {
+        /* ignore */
+      }
+      this._wsBridge = null;
+    }
+    for (const conn of this._wsConns.values()) {
+      try {
+        conn.cleanup();
+      } catch {
+        /* ignore */
+      }
+    }
+    this._wsConns.clear();
+    this._workerWsConns.clear();
+    this.swReady = false;
   }
 
   register(
@@ -201,6 +259,15 @@ export class RequestProxy extends EventEmitter {
       sw.addEventListener("statechange", check);
     });
 
+    if (this.channel) {
+      try {
+        this.channel.port1.onmessage = null;
+        this.channel.port1.close();
+      } catch {
+        /* ignore */
+      }
+      this.channel = null;
+    }
     this.channel = new MessageChannel();
     this.channel.port1.onmessage = this.onSWMessage.bind(this);
     sw.postMessage({ type: "init", port: this.channel.port2 }, [
@@ -211,6 +278,14 @@ export class RequestProxy extends EventEmitter {
 
     const reinit = () => {
       if (navigator.serviceWorker.controller) {
+        if (this.channel) {
+          try {
+            this.channel.port1.onmessage = null;
+            this.channel.port1.close();
+          } catch {
+            /* ignore */
+          }
+        }
         this.channel = new MessageChannel();
         this.channel.port1.onmessage = this.onSWMessage.bind(this);
         navigator.serviceWorker.controller.postMessage(
@@ -223,11 +298,20 @@ export class RequestProxy extends EventEmitter {
         }
       }
     };
-    navigator.serviceWorker.addEventListener("controllerchange", reinit);
-    navigator.serviceWorker.addEventListener("message", (ev) => {
+    if (this._onSwControllerChange) {
+      navigator.serviceWorker.removeEventListener("controllerchange", this._onSwControllerChange);
+    }
+    if (this._onSwMessageEvent) {
+      navigator.serviceWorker.removeEventListener("message", this._onSwMessageEvent);
+    }
+    this._onSwControllerChange = reinit;
+    this._onSwMessageEvent = (ev) => {
       if (ev.data?.type === "sw-needs-init") reinit();
-    });
+    };
+    navigator.serviceWorker.addEventListener("controllerchange", this._onSwControllerChange);
+    navigator.serviceWorker.addEventListener("message", this._onSwMessageEvent);
 
+    if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = setInterval(() => {
       this.channel?.port1.postMessage({ type: "keepalive" });
     }, TIMEOUTS.SW_HEARTBEAT);
@@ -710,6 +794,7 @@ export function getProxyInstance(opts?: ProxyOptions): RequestProxy {
 }
 
 export function resetProxy(): void {
+  instance?.dispose();
   instance = null;
 }
 

@@ -1,0 +1,129 @@
+:root {
+  --bg: #f7f5ef;
+  --card: #fffdf7;
+  --text: #1e1b16;
+  --muted: #69645b;
+  --line: #d7cfbe;
+  --brand: #1f6f5f;
+  --brand-2: #f39a5a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 10% 20%, #fff4df 0%, transparent 40%),
+    radial-gradient(circle at 90% 10%, #d6efe9 0%, transparent 30%),
+    var(--bg);
+  overflow-y: auto;
+}
+
+.page {
+  min-height: 100dvh;
+  display: grid;
+  justify-items: center;
+  align-items: start;
+  padding: 24px;
+  overflow-y: auto;
+}
+
+.card {
+  width: min(900px, 100%);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 20px;
+  box-shadow: 0 20px 45px rgba(39, 30, 17, 0.08);
+}
+
+h1 {
+  margin: 0 0 4px;
+}
+
+.sub {
+  margin: 0 0 16px;
+  color: var(--muted);
+}
+
+.row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 10px 0;
+  flex-wrap: wrap;
+}
+
+button {
+  border: 0;
+  background: var(--brand);
+  color: #fff;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+#clear-btn {
+  background: var(--brand-2);
+}
+
+label {
+  display: block;
+  margin-top: 10px;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+textarea {
+  width: 100%;
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  font: inherit;
+  background: #fff;
+}
+
+.status {
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.cmd-input {
+  flex: 1;
+  min-width: 280px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  font: inherit;
+}
+
+.terminal {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: auto;
+  height: min(60vh, 520px);
+  min-height: 320px;
+}
+
+.terminal .xterm-viewport {
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}

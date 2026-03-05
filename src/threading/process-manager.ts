@@ -18,6 +18,7 @@ import type {
 import type { VFSBridge } from "./vfs-bridge";
 import { PROCESS_WORKER_BUNDLE } from "virtual:process-worker-bundle";
 import { SLOT_SIZE } from "./sync-channel";
+import { TIMEOUTS } from "../constants/config";
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
@@ -191,6 +192,24 @@ export class ProcessManager extends EventEmitter {
         /* ignore */
       }
     }
+    const pendingHttp = [...this._httpCallbacks.values()];
+    this._httpCallbacks.clear();
+    for (const cb of pendingHttp) {
+      try {
+        cb({
+          type: "http-response",
+          requestId: -1,
+          statusCode: 503,
+          statusMessage: "Service Unavailable",
+          headers: { "Content-Type": "text/plain" },
+          body: "Process manager torn down",
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+    this._childPids.clear();
+    this._serverPorts.clear();
     this._processes.clear();
   }
 
@@ -240,12 +259,34 @@ export class ProcessManager extends EventEmitter {
     }
 
     const requestId = this._nextHttpRequestId++;
-    // console.log(`[PM] dispatchHttpRequest #${requestId} ${method} ${path} → pid ${pid}`);
+    const timeoutMs = TIMEOUTS.HTTP_DISPATCH_SAFETY;
     return new Promise((resolve) => {
-      this._httpCallbacks.set(requestId, (resp) => {
+      let settled = false;
+      const finish = (result: {
+        statusCode: number;
+        statusMessage: string;
+        headers: Record<string, string>;
+        body: string;
+      }) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+
+      const timer = setTimeout(() => {
         this._httpCallbacks.delete(requestId);
-        // console.log(`[PM] http-response #${requestId} status=${resp.statusCode}`);
-        resolve({
+        finish({
+          statusCode: 504,
+          statusMessage: "Gateway Timeout",
+          headers: { "Content-Type": "text/plain" },
+          body: `Request to port ${port} timed out`,
+        });
+      }, timeoutMs);
+
+      this._httpCallbacks.set(requestId, (resp) => {
+        clearTimeout(timer);
+        this._httpCallbacks.delete(requestId);
+        finish({
           statusCode: resp.statusCode,
           statusMessage: resp.statusMessage,
           headers: resp.headers,
@@ -253,15 +294,26 @@ export class ProcessManager extends EventEmitter {
         });
       });
 
-      handle.postMessage({
-        type: "http-request",
-        requestId,
-        port,
-        method,
-        path,
-        headers,
-        body: body ?? null,
-      });
+      try {
+        handle.postMessage({
+          type: "http-request",
+          requestId,
+          port,
+          method,
+          path,
+          headers,
+          body: body ?? null,
+        });
+      } catch {
+        clearTimeout(timer);
+        this._httpCallbacks.delete(requestId);
+        finish({
+          statusCode: 503,
+          statusMessage: "Service Unavailable",
+          headers: { "Content-Type": "text/plain" },
+          body: `Failed to dispatch request to pid ${pid}`,
+        });
+      }
     });
   }
 

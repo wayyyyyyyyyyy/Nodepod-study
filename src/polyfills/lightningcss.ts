@@ -58,8 +58,17 @@ async function ensureInit(): Promise<void> {
   return initPromise;
 }
 
-// start eagerly so WASM is ready by the time transform() is called
-ensureInit();
+const canEagerInit =
+  typeof window !== "undefined" &&
+  typeof window.document !== "undefined";
+
+// Eagerly warm in browser environments. In Node/test contexts, skip eager
+// startup to avoid unhandled dynamic-import failures.
+if (canEagerInit) {
+  ensureInit().catch(() => {
+    // Lazy callers (init/bundleAsync) will retry and surface actionable errors.
+  });
+}
 
 export function transform(opts: any): any {
   if (!wasmMod) throw new Error("lightningcss: WASM not ready yet — call await init() first");
