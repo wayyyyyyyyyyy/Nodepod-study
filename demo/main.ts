@@ -26,6 +26,7 @@ const modelIdInput = document.querySelector("#model-id-input") as HTMLInputEleme
 
 const DEFAULT_BASE_URL = "https://api.moonshot.cn/v1";
 const DEFAULT_MODEL_ID = "kimi-k2-turbo-preview";
+const AGENT_MODELS_PATH = "/home/user/.pi/agent/models.json";
 const MAX_TREE_DEPTH = 4;
 const MAX_DIR_ITEMS = 80;
 const SKIP_RECURSE_DIRS = new Set(["node_modules", ".git"]);
@@ -111,6 +112,11 @@ const sessionMeta: SessionMeta = {
   usage: "",
   model: "",
 };
+
+function updateChatControlsState(): void {
+  cmdInput.disabled = !agentSessionStarted;
+  runBtn.disabled = !agentSessionStarted || awaitingAgentReply;
+}
 
 function updateStartButtonState(): void {
   startAgentBtn.disabled = !(!!appliedConfig && installReady && !pendingStart && !pendingInstallSentinelPath);
@@ -382,6 +388,7 @@ function settleAgentReply(): void {
   if (!awaitingAgentReply) return;
   awaitingAgentReply = false;
   clearAgentSettleTimer();
+  updateChatControlsState();
 
   const { text: finalText, nextCursor } = extractFinalAgentText(
     agentTranscript,
@@ -419,6 +426,7 @@ function beginAgentReply(prompt: string): void {
   lastUserPrompt = prompt.trim();
   agentEscapeCarry = "";
   clearAgentSettleTimer();
+  updateChatControlsState();
   setStatus("Agent is thinking...", "loading");
 }
 
@@ -517,6 +525,7 @@ function finishStartSuccess(): void {
   updateStartButtonState();
   agentSessionStarted = true;
   resetAgentStreamState();
+  updateChatControlsState();
   setStatus("Agent CLI started.", "success");
   appendChatMessage("system", "Agent CLI started. You can chat below.");
 }
@@ -528,6 +537,7 @@ function finishStartError(message: string): void {
   updateStartButtonState();
   agentSessionStarted = false;
   resetAgentStreamState();
+  updateChatControlsState();
   setStatus(message, "error");
   appendChatMessage("system", message);
 }
@@ -619,6 +629,37 @@ function syncRuntimeEnv(config: AgentConfig): void {
     PI_BASE_URL: config.baseUrl,
     PI_MODEL_ID: config.modelId,
   });
+}
+
+function buildModelsJson(config: AgentConfig): string {
+  return JSON.stringify(
+    {
+      providers: {
+        "custom-openai": {
+          api: "openai-completions",
+          baseUrl: config.baseUrl,
+          apiKey: config.apiKey,
+          authHeader: true,
+          models: [
+            {
+              id: config.modelId,
+              name: config.modelId,
+              contextWindow: 128000,
+              reasoning: false,
+            },
+          ],
+        },
+      },
+    },
+    null,
+    2,
+  );
+}
+
+async function syncAgentModelsFile(config: AgentConfig): Promise<void> {
+  if (!nodepod) throw new Error("Runtime not ready.");
+  await nodepod.fs.mkdir("/home/user/.pi/agent", { recursive: true });
+  await nodepod.fs.writeFile(AGENT_MODELS_PATH, buildModelsJson(config));
 }
 
 function hasRuntimeApiKey(): boolean {
@@ -812,9 +853,9 @@ async function bootRuntime(): Promise<void> {
     applyEnvBtn.disabled = false;
     updateStartButtonState();
     toggleTerminalBtn.disabled = false;
-    runBtn.disabled = false;
     clearBtn.disabled = false;
     refreshFilesBtn.disabled = false;
+    updateChatControlsState();
 
     await refreshFileTree();
     setStatus("Runtime booted.", "success");
@@ -845,6 +886,7 @@ appendChatMessage("system", "Use this chat box as the main interaction pane.");
 setStatus("Idle", "idle");
 renderSessionMeta();
 updateStartButtonState();
+updateChatControlsState();
 
 refreshFilesBtn.addEventListener("click", () => {
   void refreshFileTree();
@@ -873,7 +915,7 @@ envCancelBtn.addEventListener("click", () => {
   envDialog.close();
 });
 
-envForm.addEventListener("submit", (event) => {
+envForm.addEventListener("submit", async (event) => {
   event.preventDefault();
 
   if (!nodepod) {
@@ -892,11 +934,19 @@ envForm.addEventListener("submit", (event) => {
   }
 
   syncRuntimeEnv(config);
+  try {
+    await syncAgentModelsFile(config);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    setStatus(`Failed to write models.json: ${message}`, "error");
+    return;
+  }
+
   appliedConfig = config;
   updateStartButtonState();
   envDialog.close();
-  appendChatMessage("system", "Agent env applied.");
-  setStatus("Agent env applied to runtime memory.", "success");
+  appendChatMessage("system", "Agent env applied and models.json synced.");
+  setStatus("Agent env applied.", "success");
 });
 
 installBtn.addEventListener("click", async () => {
@@ -938,7 +988,7 @@ installBtn.addEventListener("click", async () => {
   appendChatMessage("system", "Installing agent dependencies...");
 });
 
-startAgentBtn.addEventListener("click", () => {
+startAgentBtn.addEventListener("click", async () => {
   if (!appliedConfig) {
     setStatus("Click Apply Agent Env and confirm first.", "idle");
     return;
@@ -951,6 +1001,14 @@ startAgentBtn.addEventListener("click", () => {
   syncRuntimeEnv(appliedConfig);
   if (!hasRuntimeApiKey()) {
     setStatus("PI_API_KEY is missing in runtime. Re-apply Agent Env.", "error");
+    return;
+  }
+
+  try {
+    await syncAgentModelsFile(appliedConfig);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    setStatus(`Failed to update models.json: ${message}`, "error");
     return;
   }
 
