@@ -99,6 +99,7 @@ let pendingInstallSentinelPath: string | null = null;
 let installPollTimer: number | null = null;
 let installPollStartedAt = 0;
 let pendingStart = false;
+let awaitingLateStartSignal = false;
 let pendingStartBuffer = "";
 let startWatchdogTimer: number | null = null;
 let agentTranscript = "";
@@ -435,7 +436,7 @@ function containsPromptBoundary(clean: string): boolean {
 }
 
 function collectAgentOutput(clean: string): void {
-  if (!agentSessionStarted && !pendingStart) return;
+  if (!agentSessionStarted && !pendingStart && !awaitingLateStartSignal) return;
   if (!clean) return;
   updateSessionMetaFromChunk(clean);
 
@@ -520,6 +521,7 @@ function clearStartWatchdog(): void {
 
 function finishStartSuccess(): void {
   pendingStart = false;
+  awaitingLateStartSignal = false;
   pendingStartBuffer = "";
   clearStartWatchdog();
   updateStartButtonState();
@@ -532,6 +534,7 @@ function finishStartSuccess(): void {
 
 function finishStartError(message: string): void {
   pendingStart = false;
+  awaitingLateStartSignal = false;
   pendingStartBuffer = "";
   clearStartWatchdog();
   updateStartButtonState();
@@ -543,7 +546,7 @@ function finishStartError(message: string): void {
 }
 
 function handleStartTracking(clean: string): void {
-  if (!pendingStart) return;
+  if (!pendingStart && !awaitingLateStartSignal) return;
 
   pendingStartBuffer += clean;
   if (pendingStartBuffer.length > 12000) {
@@ -1013,13 +1016,17 @@ startAgentBtn.addEventListener("click", async () => {
   }
 
   pendingStart = true;
+  awaitingLateStartSignal = false;
   resetAgentStreamState();
   updateStartButtonState();
   pendingStartBuffer = "";
   clearStartWatchdog();
   startWatchdogTimer = window.setTimeout(() => {
     if (!pendingStart) return;
-    finishStartError("Agent startup timeout. Retry Start Agent CLI or open terminal.");
+    pendingStart = false;
+    awaitingLateStartSignal = true;
+    updateStartButtonState();
+    setStatus("Startup is slower than expected. Waiting for CLI banner...", "loading");
   }, 12000);
 
   sendCommand(`${buildExportCommand(appliedConfig)} && ${buildStartAgentCommand()}`);
