@@ -4,6 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 
 const statusEl = document.querySelector("#status") as HTMLSpanElement;
+const sessionMetaEl = document.querySelector("#session-meta") as HTMLSpanElement;
 const installBtn = document.querySelector("#install-btn") as HTMLButtonElement;
 const applyEnvBtn = document.querySelector("#apply-env-btn") as HTMLButtonElement;
 const startAgentBtn = document.querySelector("#start-agent-btn") as HTMLButtonElement;
@@ -28,9 +29,8 @@ const DEFAULT_MODEL_ID = "kimi-k2-turbo-preview";
 const MAX_TREE_DEPTH = 4;
 const MAX_DIR_ITEMS = 80;
 const SKIP_RECURSE_DIRS = new Set(["node_modules", ".git"]);
-const AGENT_PARTIAL_FLUSH_MS = 220;
-const AGENT_SETTLE_MS = 1400;
-const AGENT_STREAM_BUFFER_LIMIT = 12000;
+const AGENT_SETTLE_MS = 4500;
+const AGENT_STREAM_BUFFER_LIMIT = 120000;
 const AGENT_NOISE_PATTERNS: RegExp[] = [
   /^escape to interrupt$/i,
   /^ctrl\+c to clear$/i,
@@ -61,7 +61,8 @@ const AGENT_NOISE_PATTERNS: RegExp[] = [
   /^[\w.-]+\s+[•·]\s+(?:low|medium|high)$/i,
   /^pi v\d+\.\d+\.\d+$/i,
 ];
-const IMPORTANT_AGENT_OUTPUT = /error|failed|invalid|401|authentication|timeout|connection/i;
+const CLI_USAGE_MODEL_REGEX =
+  /^(↑\d+\s+↓\d+\s+R\d+\s+[0-9.]+%\/[0-9.]+[kKmM]?\s+\(auto\))\s+(.+)$/;
 
 type AgentConfig = {
   apiKey: string;
@@ -80,25 +81,35 @@ type TreeNode = {
 
 type StatusState = "idle" | "loading" | "success" | "error";
 
+type SessionMeta = {
+  cwd: string;
+  usage: string;
+  model: string;
+};
+
 let nodepod: Nodepod | null = null;
 let terminal: NodepodTerminal | null = null;
 let appliedConfig: AgentConfig | null = null;
 let installReady = false;
 let terminalVisible = false;
 let agentSessionStarted = false;
-let liveAgentBubble: HTMLDivElement | null = null;
 let pendingInstallSentinelPath: string | null = null;
 let installPollTimer: number | null = null;
 let installPollStartedAt = 0;
 let pendingStart = false;
 let pendingStartBuffer = "";
 let startWatchdogTimer: number | null = null;
-let agentStreamBuffer = "";
-let agentPartialFlushTimer: number | null = null;
+let agentTranscript = "";
 let agentSettleTimer: number | null = null;
-let lastAgentLine = "";
 let awaitingAgentReply = false;
 let agentEscapeCarry = "";
+let lastUserPrompt = "";
+let agentExtractCursor = 0;
+const sessionMeta: SessionMeta = {
+  cwd: "",
+  usage: "",
+  model: "",
+};
 
 function updateStartButtonState(): void {
   startAgentBtn.disabled = !(!!appliedConfig && installReady && !pendingStart && !pendingInstallSentinelPath);
@@ -185,13 +196,8 @@ function normalizeAgentChunk(raw: string): string {
     .replace(/\x1b[@-Z\\-_]/g, "")
     .replace(/\x1b\[200~/g, "")
     .replace(/\x1b\[201~/g, "")
-    .replace(/\r\n/g, "\n");
-
-  // Keep only the latest carriage-overwritten segment in each visual line.
-  source = source
-    .split("\n")
-    .map((line) => line.split("\r").pop() ?? "")
-    .join("\n");
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
 
   const clean = stripBackspaces(
     source
@@ -222,13 +228,6 @@ function appendChatMessage(role: "system" | "user" | "agent", text: string): HTM
   return message;
 }
 
-function clearAgentPartialFlushTimer(): void {
-  if (agentPartialFlushTimer !== null) {
-    window.clearTimeout(agentPartialFlushTimer);
-    agentPartialFlushTimer = null;
-  }
-}
-
 function clearAgentSettleTimer(): void {
   if (agentSettleTimer !== null) {
     window.clearTimeout(agentSettleTimer);
@@ -236,13 +235,54 @@ function clearAgentSettleTimer(): void {
   }
 }
 
+function renderSessionMeta(): void {
+  if (!sessionMetaEl) return;
+  const parts: string[] = [];
+  if (sessionMeta.cwd) parts.push(sessionMeta.cwd);
+  if (sessionMeta.usage) parts.push(sessionMeta.usage);
+  if (sessionMeta.model) parts.push(sessionMeta.model);
+  sessionMetaEl.textContent = parts.length > 0 ? parts.join(" | ") : "Session info will appear here.";
+}
+
+function updateSessionMetaFromChunk(clean: string): void {
+  const lines = clean
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  let changed = false;
+  for (const line of lines) {
+    if (/^~\/\S+/.test(line) && sessionMeta.cwd !== line) {
+      sessionMeta.cwd = line;
+      changed = true;
+      continue;
+    }
+
+    const usageModel = line.match(CLI_USAGE_MODEL_REGEX);
+    if (usageModel) {
+      if (sessionMeta.usage !== usageModel[1]) {
+        sessionMeta.usage = usageModel[1];
+        changed = true;
+      }
+      const model = usageModel[2].trim();
+      if (model && sessionMeta.model !== model) {
+        sessionMeta.model = model;
+        changed = true;
+      }
+      continue;
+    }
+  }
+
+  if (changed) renderSessionMeta();
+}
+
 function resetAgentStreamState(): void {
-  clearAgentPartialFlushTimer();
   clearAgentSettleTimer();
-  agentStreamBuffer = "";
-  lastAgentLine = "";
+  agentTranscript = "";
   awaitingAgentReply = false;
-  resetLiveAgentBubble();
+  lastUserPrompt = "";
+  agentEscapeCarry = "";
+  agentExtractCursor = 0;
 }
 
 function shouldIgnoreAgentLine(trimmedLine: string): boolean {
@@ -250,51 +290,104 @@ function shouldIgnoreAgentLine(trimmedLine: string): boolean {
   return AGENT_NOISE_PATTERNS.some((pattern) => pattern.test(trimmedLine));
 }
 
-function appendAgentLine(line: string): void {
-  const normalized = line.replace(/[ \t]+$/g, "");
-  const trimmed = normalized.trim();
-  if (shouldIgnoreAgentLine(trimmed)) return;
-  if (trimmed === lastAgentLine) return;
+function normalizeExtractedLines(lines: string[], promptText: string): string {
+  const kept: string[] = [];
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) {
+      if (kept.length > 0 && kept[kept.length - 1] !== "") kept.push("");
+      continue;
+    }
+    if (promptText && trimmed === promptText) continue;
+    if (shouldIgnoreAgentLine(trimmed)) continue;
+    kept.push(rawLine);
+  }
 
-  if (!liveAgentBubble) {
-    liveAgentBubble = appendChatMessage("agent", "");
+  const deduped: string[] = [];
+  for (const rawLine of kept) {
+    const line = rawLine.trim();
+    if (deduped.length === 0) {
+      deduped.push(rawLine);
+      continue;
+    }
+
+    const prevRaw = deduped[deduped.length - 1];
+    const prev = prevRaw.trim();
+
+    if (!line && !prev) continue;
+    if (line === prev) continue;
+
+    // Collapse TUI incremental redraw frames:
+    // "我是Pi" -> "我是Pi," -> "我是Pi, 一个..." keeps only the latest/longest frame.
+    if (
+      (line.startsWith(prev) || prev.startsWith(line)) &&
+      line.length <= prev.length + 220 &&
+      prev.length <= line.length + 220
+    ) {
+      deduped[deduped.length - 1] = line.length >= prev.length ? rawLine : prevRaw;
+      continue;
+    }
+
+    deduped.push(rawLine);
   }
-  if (liveAgentBubble.textContent && !liveAgentBubble.textContent.endsWith("\n")) {
-    liveAgentBubble.textContent += "\n";
-  }
-  liveAgentBubble.textContent += trimmed;
-  lastAgentLine = trimmed;
-  scrollChatToBottom();
+
+  while (deduped.length > 0 && deduped[0] === "") deduped.shift();
+  while (deduped.length > 0 && deduped[deduped.length - 1] === "") deduped.pop();
+  return deduped.join("\n").trim();
 }
 
-function flushAgentBuffer(forceRemainder = false): void {
-  while (true) {
-    const newlineIndex = agentStreamBuffer.indexOf("\n");
-    if (newlineIndex === -1) break;
-    const line = agentStreamBuffer.slice(0, newlineIndex);
-    agentStreamBuffer = agentStreamBuffer.slice(newlineIndex + 1);
-    appendAgentLine(line);
+function extractFinalAgentText(
+  transcript: string,
+  cursor: number,
+  prompt: string,
+): { text: string; nextCursor: number } {
+  const promptText = prompt.trim();
+  const safeCursor = Math.max(0, Math.min(cursor, transcript.length));
+  const scoped = transcript.slice(safeCursor);
+  if (!scoped.trim()) {
+    return { text: "", nextCursor: transcript.length };
   }
 
-  if (forceRemainder) {
-    const tail = agentStreamBuffer.trim();
-    if (tail) appendAgentLine(tail);
-    agentStreamBuffer = "";
+  let startOffset = 0;
+  if (promptText) {
+    const promptAt = scoped.indexOf(promptText);
+    if (promptAt !== -1) {
+      startOffset = promptAt + promptText.length;
+    }
   }
-}
 
-function scheduleAgentPartialFlush(): void {
-  clearAgentPartialFlushTimer();
-  agentPartialFlushTimer = window.setTimeout(() => {
-    flushAgentBuffer(true);
-  }, AGENT_PARTIAL_FLUSH_MS);
+  const extractedRaw = scoped.slice(startOffset);
+  const lines = extractedRaw
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/g, ""));
+  const text = normalizeExtractedLines(lines, promptText);
+  return { text, nextCursor: transcript.length };
 }
 
 function settleAgentReply(): void {
-  flushAgentBuffer(true);
+  if (!awaitingAgentReply) return;
   awaitingAgentReply = false;
-  resetLiveAgentBubble();
   clearAgentSettleTimer();
+
+  const { text: finalText, nextCursor } = extractFinalAgentText(
+    agentTranscript,
+    agentExtractCursor,
+    lastUserPrompt,
+  );
+  if (finalText) {
+    appendChatMessage("agent", finalText);
+  } else if (agentTranscript.trim()) {
+    const fallback = agentTranscript
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(-4)
+      .join("\n");
+    if (fallback) appendChatMessage("agent", fallback);
+  }
+
+  agentExtractCursor = nextCursor;
+  lastUserPrompt = "";
   if (agentSessionStarted) {
     setStatus("Agent ready.", "success");
   }
@@ -307,38 +400,33 @@ function scheduleAgentSettle(): void {
   }, AGENT_SETTLE_MS);
 }
 
-function beginAgentReply(): void {
+function beginAgentReply(prompt: string): void {
   awaitingAgentReply = true;
-  lastAgentLine = "";
-  agentStreamBuffer = "";
-  clearAgentPartialFlushTimer();
+  lastUserPrompt = prompt.trim();
+  agentEscapeCarry = "";
   clearAgentSettleTimer();
-  resetLiveAgentBubble();
-  setStatus("Waiting for agent output...", "loading");
+  setStatus("Agent is thinking...", "loading");
 }
 
-function appendAgentOutput(raw: string): void {
+function collectAgentOutput(raw: string): void {
   if (!agentSessionStarted && !pendingStart) return;
 
   const clean = normalizeAgentChunk(raw);
   if (!clean) return;
+  updateSessionMetaFromChunk(clean);
 
-  if (!awaitingAgentReply && !IMPORTANT_AGENT_OUTPUT.test(clean)) {
+  if (!awaitingAgentReply) {
     return;
   }
 
-  agentStreamBuffer += clean;
-  if (agentStreamBuffer.length > AGENT_STREAM_BUFFER_LIMIT) {
-    agentStreamBuffer = agentStreamBuffer.slice(-AGENT_STREAM_BUFFER_LIMIT);
+  agentTranscript += clean;
+  if (agentTranscript.length > AGENT_STREAM_BUFFER_LIMIT) {
+    const overflow = agentTranscript.length - AGENT_STREAM_BUFFER_LIMIT;
+    agentTranscript = agentTranscript.slice(overflow);
+    agentExtractCursor = Math.max(0, agentExtractCursor - overflow);
   }
 
-  flushAgentBuffer(false);
-  scheduleAgentPartialFlush();
   scheduleAgentSettle();
-}
-
-function resetLiveAgentBubble(): void {
-  liveAgentBubble = null;
 }
 
 function createDoneToken(prefix: string): string {
@@ -464,7 +552,7 @@ function wireTerminalOutputMirror(term: NodepodTerminal): void {
   if (typeof originalWriteOutput === "function") {
     t._writeOutput = (text: string, isError = false) => {
       handleWorkflowOutput(String(text ?? ""));
-      appendAgentOutput(String(text ?? ""));
+      collectAgentOutput(String(text ?? ""));
       return originalWriteOutput(text, isError);
     };
   }
@@ -729,7 +817,7 @@ function sendAgentPromptFromInput(): void {
   }
 
   appendChatMessage("user", prompt);
-  beginAgentReply();
+  beginAgentReply(prompt);
   sendCommand(prompt);
   cmdInput.value = "";
 }
@@ -737,6 +825,7 @@ function sendAgentPromptFromInput(): void {
 appendChatMessage("system", "LiveNode Agent ready flow: 1) Install Agent  2) Configure Env  3) Start CLI");
 appendChatMessage("system", "Use this chat box as the main interaction pane.");
 setStatus("Idle", "idle");
+renderSessionMeta();
 updateStartButtonState();
 
 refreshFilesBtn.addEventListener("click", () => {
@@ -857,7 +946,6 @@ startAgentBtn.addEventListener("click", () => {
     finishStartError("Agent startup timeout. Retry Start Agent CLI or open terminal.");
   }, 12000);
 
-  resetLiveAgentBubble();
   sendCommand(`${buildExportCommand(appliedConfig)} && ${buildStartAgentCommand()}`);
   setStatus("Starting Agent CLI...", "loading");
 });

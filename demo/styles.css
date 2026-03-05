@@ -168,6 +168,8 @@ button:disabled {
   min-height: 30px;
   display: flex;
   align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
   padding: 6px 10px;
   border-radius: 999px;
   border: 1px solid var(--line);
@@ -214,6 +216,17 @@ button:disabled {
 .status[data-state="error"]::before {
   border: 0;
   background: #e15241;
+}
+
+.session-meta {
+  margin-left: auto;
+  max-width: min(58%, 780px);
+  color: rgba(102, 112, 133, 0.95);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
 }
 
 .hint {
@@ -521,6 +534,12 @@ label {
 
   .status-bar {
     padding: 6px 10px;
+  }
+
+  .session-meta {
+    margin-left: 0;
+    max-width: 100%;
+    width: 100%;
   }
 
   .chat-log {
