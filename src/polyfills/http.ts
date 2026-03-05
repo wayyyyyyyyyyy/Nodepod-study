@@ -738,6 +738,35 @@ function fetchProxy(): string | null {
   }
 }
 
+function isLatin1HeaderValue(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    if (value.charCodeAt(i) > 0xff) return false;
+  }
+  return true;
+}
+
+function buildSafeFetchHeaders(raw: Record<string, string>): { headers: Headers; dropped: string[] } {
+  const headers = new Headers();
+  const dropped: string[] = [];
+  for (const [name, rawValue] of Object.entries(raw)) {
+    const normalizedName = String(name ?? "").trim();
+    if (!normalizedName) continue;
+
+    const normalizedValue = String(rawValue ?? "").replace(/[\r\n]+/g, " ");
+    if (!isLatin1HeaderValue(normalizedValue)) {
+      dropped.push(normalizedName);
+      continue;
+    }
+
+    try {
+      headers.append(normalizedName, normalizedValue);
+    } catch {
+      dropped.push(normalizedName);
+    }
+  }
+  return { headers, dropped };
+}
+
 // ClientRequest  (fetch-backed)
 
 export interface ClientRequest extends Writable {
@@ -960,7 +989,14 @@ ClientRequest.prototype._dispatch = async function _dispatch(): Promise<void> {
     const proxy = fetchProxy();
     const targetUrl = proxy ? proxy + encodeURIComponent(endpoint) : endpoint;
 
-    const init: RequestInit = { method: this.method, headers: this.headers };
+    const { headers: safeHeaders, dropped } = buildSafeFetchHeaders(this.headers);
+    if (dropped.length > 0 && typeof console !== "undefined" && typeof console.warn === "function") {
+      console.warn(
+        `[nodepod/http] Dropped invalid request headers (non ISO-8859-1 or malformed): ${dropped.join(", ")}`,
+      );
+    }
+
+    const init: RequestInit = { method: this.method, headers: safeHeaders };
     if (
       this._pending.length > 0 &&
       this.method !== "GET" &&
@@ -992,6 +1028,15 @@ ClientRequest.prototype._dispatch = async function _dispatch(): Promise<void> {
     if (this._waitTimer) clearTimeout(this._waitTimer);
     if (this._cancelled) return;
     if (err instanceof Error && err.name === "AbortError") return;
+    if (err instanceof Error && /non ISO-8859-1/i.test(err.message)) {
+      this.emit(
+        "error",
+        new Error(
+          "Invalid HTTP header encoding. A request header contains non ISO-8859-1 characters.",
+        ),
+      );
+      return;
+    }
     this.emit("error", err);
   }
 };

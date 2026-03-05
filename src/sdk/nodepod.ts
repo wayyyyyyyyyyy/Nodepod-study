@@ -117,6 +117,23 @@ export class Nodepod {
     this._proxy.setProcessManager(this._processManager);
   }
 
+  setEnv(env: Record<string, string | undefined | null>): void {
+    for (const [key, value] of Object.entries(env)) {
+      if (value == null || value === "") {
+        delete this._baseEnv[key];
+      } else {
+        this._baseEnv[key] = String(value);
+      }
+    }
+  }
+
+  getEnv(key?: string): string | Record<string, string> | undefined {
+    if (typeof key === "string") {
+      return this._baseEnv[key];
+    }
+    return { ...this._baseEnv };
+  }
+
   /* ---- Static factory ---- */
 
   static async boot(opts: NodepodOptions = {}): Promise<Nodepod> {

@@ -262,7 +262,7 @@ async function handleShellExec(msg: MainToWorker_Exec): Promise<void> {
     });
 
     // shellExec() NOT child_process.exec() — the latter spawns a new worker, causing recursion
-    shell.shellExec(shellCmd, {}, (error, stdout, stderr) => {
+    shell.shellExec(shellCmd, { env: msg.env ?? undefined }, (error, stdout, stderr) => {
       // Don't clearStreamingCallbacks — background children (e.g. vite dev)
       // may still need the output sinks. Cleaned up on worker termination.
 

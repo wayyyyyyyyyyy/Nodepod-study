@@ -3,37 +3,102 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Nodepod CLI Terminal Demo</title>
+    <title>LiveNode Agent</title>
     <link rel="stylesheet" href="/demo/styles.css" />
   </head>
   <body>
     <main class="page">
-      <section class="card">
-        <h1>Browser Terminal for `pi-momo` CLI</h1>
-        <p class="sub">
-          Boot Nodepod runtime, then run `pi-momo` from this browser terminal.
-        </p>
+      <section class="workspace">
+        <aside class="sidebar">
+          <h2>Workspace</h2>
+          <div class="row">
+            <button id="refresh-files-btn" disabled>Refresh Files</button>
+          </div>
+          <div id="file-tree" class="file-tree">Boot runtime to load files.</div>
+        </aside>
 
-        <div class="row">
-          <button id="boot-btn">1) Boot Runtime</button>
-          <button id="install-btn" disabled>2) Install pi-momo</button>
-          <span id="status" class="status">Idle</span>
-        </div>
+        <section class="card main-panel">
+          <h1>LiveNode Agent</h1>
+          <p class="sub">Install once, configure runtime env, then chat with agent directly.</p>
 
-        <label for="cmd-input">Command to run</label>
-        <div class="row">
-          <input id="cmd-input" class="cmd-input" value="npx pi-momo --help" />
-          <button id="run-btn" disabled>Run Command</button>
-        </div>
+          <div class="row actions-row">
+            <button id="install-btn">1) Install Agent</button>
+            <button id="apply-env-btn" disabled>2) Configure Env</button>
+            <button id="start-agent-btn" disabled>3) Start CLI</button>
+            <button id="toggle-terminal-btn" disabled>Show Terminal</button>
+          </div>
+          <div class="status-bar">
+            <span id="status" class="status">Idle</span>
+          </div>
 
-        <div class="row">
-          <button id="clear-btn" disabled>Clear Terminal</button>
-          <span class="hint">You can type directly in terminal too.</span>
-        </div>
+          <section id="chat-log" class="chat-log" aria-live="polite"></section>
 
-        <div id="terminal" class="terminal"></div>
+          <div class="row chat-input-row">
+            <input
+              id="cmd-input"
+              class="cmd-input"
+              placeholder="Type message to agent..."
+              autocomplete="off"
+            />
+            <button id="run-btn" disabled>Send</button>
+          </div>
+
+          <section id="terminal-panel" class="terminal-panel is-collapsed">
+            <div class="row">
+              <button id="clear-btn" disabled>Clear Terminal</button>
+              <span class="hint">Terminal is optional and can stay collapsed.</span>
+            </div>
+            <div id="terminal" class="terminal"></div>
+          </section>
+        </section>
       </section>
     </main>
+
+    <dialog id="env-dialog" class="env-dialog">
+      <form id="env-form" method="dialog" class="env-form">
+        <h2>Agent Environment</h2>
+        <p class="sub">
+          Fill and submit once, then start the agent.
+        </p>
+        <label class="config-field" for="api-key-input">
+          API Key
+          <input
+            id="api-key-input"
+            class="text-input"
+            type="password"
+            placeholder="sk-..."
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </label>
+        <label class="config-field" for="base-url-input">
+          Base URL
+          <input
+            id="base-url-input"
+            class="text-input"
+            type="text"
+            value="https://api.moonshot.cn/v1"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </label>
+        <label class="config-field" for="model-id-input">
+          Model Name
+          <input
+            id="model-id-input"
+            class="text-input"
+            type="text"
+            value="kimi-k2-turbo-preview"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </label>
+        <div class="row">
+          <button id="env-submit-btn" type="submit">Confirm Env</button>
+          <button id="env-cancel-btn" type="button">Cancel</button>
+        </div>
+      </form>
+    </dialog>
 
     <script type="module" src="/demo/main.ts"></script>
   </body>
