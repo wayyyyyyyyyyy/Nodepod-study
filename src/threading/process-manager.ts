@@ -600,16 +600,25 @@ export class ProcessManager extends EventEmitter {
         });
 
         // IPC: parent -> child
-        handle.on("ipc-message", (ipcMsg: any) => {
+        const onParentIpc = (ipcMsg: any) => {
           if (ipcMsg.targetRequestId === msg.requestId) {
             childHandle.postMessage({
               type: "ipc-message",
               data: ipcMsg.data,
             });
           }
-        });
+        };
+        handle.on("ipc-message", onParentIpc);
+
+        let parentIpcDetached = false;
+        const detachParentIpc = () => {
+          if (parentIpcDetached) return;
+          parentIpcDetached = true;
+          handle.removeListener("ipc-message", onParentIpc);
+        };
 
         childHandle.on("exit", (exitCode: number) => {
+          detachParentIpc();
           if (!handle.workerExited) {
             handle.postMessage({
               type: "child-exit",
@@ -626,6 +635,10 @@ export class ProcessManager extends EventEmitter {
           }
           handle.releaseExit();
           handle.releaseShellDone();
+        });
+
+        childHandle.on("worker-error", () => {
+          detachParentIpc();
         });
       } catch (e) {
         handle.postMessage({
@@ -731,16 +744,25 @@ export class ProcessManager extends EventEmitter {
           }
         });
 
-        handle.on("ipc-message", (ipcMsg: any) => {
+        const onParentIpc = (ipcMsg: any) => {
           if (ipcMsg.targetRequestId === msg.requestId) {
             childHandle.postMessage({
               type: "ipc-message",
               data: ipcMsg.data,
             });
           }
-        });
+        };
+        handle.on("ipc-message", onParentIpc);
+
+        let parentIpcDetached = false;
+        const detachParentIpc = () => {
+          if (parentIpcDetached) return;
+          parentIpcDetached = true;
+          handle.removeListener("ipc-message", onParentIpc);
+        };
 
         childHandle.on("exit", (exitCode: number) => {
+          detachParentIpc();
           if (msg.isEval) {
             try {
               this._volume.unlinkSync(`/__wt_eval_${msg.threadId}__.js`);
@@ -765,6 +787,10 @@ export class ProcessManager extends EventEmitter {
           }
           handle.releaseExit();
           handle.releaseShellDone();
+        });
+
+        childHandle.on("worker-error", () => {
+          detachParentIpc();
         });
       } catch (e) {
         handle.postMessage({
@@ -953,4 +979,3 @@ export class ProcessManager extends EventEmitter {
     }
   }
 }
-

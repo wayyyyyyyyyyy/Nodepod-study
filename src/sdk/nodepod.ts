@@ -235,7 +235,7 @@ export class Nodepod {
 
     const isNodeCmd = cmd === "node" && args?.length;
     if (isNodeCmd) {
-      const filePath = this._resolveCommand(cmd, args);
+      const filePath = this._resolveCommand(cmd, args, execCwd);
       handle.exec({
         type: "exec",
         filePath,
@@ -260,11 +260,11 @@ export class Nodepod {
     return proc;
   }
 
-  private _resolveCommand(cmd: string, args?: string[]): string {
+  private _resolveCommand(cmd: string, args?: string[], baseCwd: string = this._cwd): string {
     if (cmd === "node" && args?.length) {
       const filePath = args[0];
       if (filePath.startsWith("/")) return filePath;
-      return `${this._cwd}/${filePath}`.replace(/\/+/g, "/");
+      return `${baseCwd}/${filePath}`.replace(/\/+/g, "/");
     }
     return cmd;
   }

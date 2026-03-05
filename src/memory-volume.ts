@@ -232,7 +232,7 @@ export class MemoryVolume {
       }
       result.push({ path: currentPath, kind: 'file', data });
     } else if (node.kind === 'symlink') {
-      result.push({ path: currentPath, kind: 'file', data: `symlink:${node.target}` });
+      result.push({ path: currentPath, kind: 'symlink', data: node.target || '/' });
     } else if (node.kind === 'directory') {
       result.push({ path: currentPath, kind: 'directory' });
       if (node.children) {
@@ -287,6 +287,18 @@ export class MemoryVolume {
       if (entry.kind === 'directory') {
         vol.mkdirSync(entry.path, { recursive: true });
       } else if (entry.kind === 'file') {
+        // Backward compatibility for older snapshots that encoded symlinks as:
+        // { kind: "file", data: "symlink:/target/path" }
+        if (entry.data?.startsWith('symlink:')) {
+          const target = entry.data.slice('symlink:'.length) || '/';
+          const parentDir = entry.path.substring(0, entry.path.lastIndexOf('/')) || '/';
+          if (parentDir !== '/' && !vol.existsSync(parentDir)) {
+            vol.mkdirSync(parentDir, { recursive: true });
+          }
+          vol.symlinkSync(target, entry.path);
+          continue;
+        }
+
         let content: Uint8Array;
         if (entry.data) {
           content = base64ToBytes(entry.data);
@@ -298,6 +310,12 @@ export class MemoryVolume {
           vol.mkdirSync(parentDir, { recursive: true });
         }
         vol.writeInternal(vol.normalize(entry.path), content, false);
+      } else if (entry.kind === 'symlink') {
+        const parentDir = entry.path.substring(0, entry.path.lastIndexOf('/')) || '/';
+        if (parentDir !== '/' && !vol.existsSync(parentDir)) {
+          vol.mkdirSync(parentDir, { recursive: true });
+        }
+        vol.symlinkSync(entry.data || '/', entry.path);
       }
     }
 
@@ -570,7 +588,7 @@ export class MemoryVolume {
 
     const target = parent.children!.get(name);
     if (!target) throw makeSystemError('ENOENT', 'unlink', p);
-    if (target.kind !== 'file') throw makeSystemError('EISDIR', 'unlink', p);
+    if (target.kind === 'directory') throw makeSystemError('EISDIR', 'unlink', p);
 
     parent.children!.delete(name);
     this.triggerWatchers(norm, 'rename');
@@ -755,7 +773,12 @@ export class MemoryVolume {
   }
 
   lstat(p: string, cb?: (err: Error | null, stats?: FileStat) => void): void {
-    this.stat(p, cb);
+    try {
+      const stats = this.lstatSync(p);
+      if (cb) setTimeout(() => cb(null, stats), 0);
+    } catch (err) {
+      if (cb) setTimeout(() => cb(err as Error), 0);
+    }
   }
 
   readdir(

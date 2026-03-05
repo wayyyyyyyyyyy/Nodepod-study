@@ -172,6 +172,15 @@ describe("MemoryVolume", () => {
       expect(vol.existsSync("/f")).toBe(false);
     });
 
+    it("removes a symlink without deleting the target", () => {
+      const vol = new MemoryVolume();
+      vol.writeFileSync("/target", "data");
+      vol.symlinkSync("/target", "/link");
+      vol.unlinkSync("/link");
+      expect(vol.existsSync("/link")).toBe(false);
+      expect(vol.readFileSync("/target", "utf8")).toBe("data");
+    });
+
     it("throws ENOENT for nonexistent file", () => {
       const vol = new MemoryVolume();
       expect(() => vol.unlinkSync("/nope")).toThrow();
@@ -286,6 +295,22 @@ describe("MemoryVolume", () => {
       vol.symlinkSync("/target", "/link");
       expect(vol.lstatSync("/link").isSymbolicLink()).toBe(true);
     });
+
+    it("lstat (async) reports symlink for symlink node", async () => {
+      const vol = new MemoryVolume();
+      vol.writeFileSync("/target", "data");
+      vol.symlinkSync("/target", "/link");
+
+      const stats = await new Promise<ReturnType<MemoryVolume["lstatSync"]>>((resolve, reject) => {
+        vol.lstat("/link", (err, s) => {
+          if (err) return reject(err);
+          if (!s) return reject(new Error("Missing stats"));
+          resolve(s);
+        });
+      });
+
+      expect(stats.isSymbolicLink()).toBe(true);
+    });
   });
 
   describe("path normalization", () => {
@@ -339,6 +364,34 @@ describe("MemoryVolume", () => {
       const snap = vol.toSnapshot();
       const vol2 = MemoryVolume.fromSnapshot(snap);
       expect(vol2.readFileSync("/bin")).toEqual(data);
+    });
+
+    it("round-trips symlinks", () => {
+      const vol = new MemoryVolume();
+      vol.writeFileSync("/target", "data");
+      vol.symlinkSync("/target", "/link");
+
+      const snap = vol.toSnapshot();
+      const linkEntry = snap.entries.find((e) => e.path === "/link");
+      expect(linkEntry?.kind).toBe("symlink");
+
+      const vol2 = MemoryVolume.fromSnapshot(snap);
+      expect(vol2.lstatSync("/link").isSymbolicLink()).toBe(true);
+      expect(vol2.readFileSync("/link", "utf8")).toBe("data");
+    });
+
+    it("restores legacy symlink snapshot entries", () => {
+      const legacySnapshot = {
+        entries: [
+          { path: "/", kind: "directory" as const },
+          { path: "/target", kind: "file" as const, data: btoa("data") },
+          { path: "/link", kind: "file" as const, data: "symlink:/target" },
+        ],
+      };
+
+      const vol = MemoryVolume.fromSnapshot(legacySnapshot);
+      expect(vol.lstatSync("/link").isSymbolicLink()).toBe(true);
+      expect(vol.readFileSync("/link", "utf8")).toBe("data");
     });
   });
 

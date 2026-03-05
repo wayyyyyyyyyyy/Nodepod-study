@@ -51,6 +51,6 @@ export interface VolumeSnapshot {
 
 export interface VolumeEntry {
   path: string;
-  kind: 'file' | 'directory';
-  data?: string; // base64-encoded
+  kind: 'file' | 'directory' | 'symlink';
+  data?: string; // base64-encoded file content, or symlink target when kind='symlink'
 }
