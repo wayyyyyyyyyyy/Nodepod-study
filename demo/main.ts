@@ -29,8 +29,7 @@ const DEFAULT_MODEL_ID = "kimi-k2-turbo-preview";
 const MAX_TREE_DEPTH = 4;
 const MAX_DIR_ITEMS = 80;
 const SKIP_RECURSE_DIRS = new Set(["node_modules", ".git"]);
-const AGENT_IDLE_SETTLE_MS = 6500;
-const AGENT_PROMPT_SETTLE_MS = 240;
+const AGENT_SETTLE_MS = 4500;
 const AGENT_STREAM_BUFFER_LIMIT = 120000;
 const AGENT_NOISE_PATTERNS: RegExp[] = [
   /^escape to interrupt$/i,
@@ -291,21 +290,6 @@ function shouldIgnoreAgentLine(trimmedLine: string): boolean {
   return AGENT_NOISE_PATTERNS.some((pattern) => pattern.test(trimmedLine));
 }
 
-function isLikelyIncrementalFrame(prevRaw: string, nextRaw: string): boolean {
-  const prev = prevRaw.trim();
-  const next = nextRaw.trim();
-  if (!prev || !next) return false;
-
-  if (/^\s*[-*]\s/.test(prevRaw) || /^\s*[-*]\s/.test(nextRaw)) return false;
-
-  const shorter = prev.length <= next.length ? prev : next;
-  const longer = prev.length <= next.length ? next : prev;
-  if (!longer.startsWith(shorter)) return false;
-
-  const delta = longer.length - shorter.length;
-  return delta > 0 && delta <= 24;
-}
-
 function normalizeExtractedLines(lines: string[], promptText: string): string {
   const kept: string[] = [];
   for (const rawLine of lines) {
@@ -333,7 +317,13 @@ function normalizeExtractedLines(lines: string[], promptText: string): string {
     if (!line && !prev) continue;
     if (line === prev) continue;
 
-    if (isLikelyIncrementalFrame(prevRaw, rawLine)) {
+    // Collapse TUI incremental redraw frames:
+    // "我是Pi" -> "我是Pi," -> "我是Pi, 一个..." keeps only the latest/longest frame.
+    if (
+      (line.startsWith(prev) || prev.startsWith(line)) &&
+      line.length <= prev.length + 220 &&
+      prev.length <= line.length + 220
+    ) {
       deduped[deduped.length - 1] = line.length >= prev.length ? rawLine : prevRaw;
       continue;
     }
@@ -358,19 +348,15 @@ function extractFinalAgentText(
     return { text: "", nextCursor: transcript.length };
   }
 
-  const scopedLines = scoped.split("\n");
-  let startLine = 0;
+  let startOffset = 0;
   if (promptText) {
-    const promptLineAt = scopedLines.findIndex((line, idx) => idx < 8 && line.trim() === promptText);
-    if (promptLineAt !== -1) {
-      startLine = promptLineAt + 1;
-      while (startLine < scopedLines.length && scopedLines[startLine].trim() === "") {
-        startLine += 1;
-      }
+    const promptAt = scoped.indexOf(promptText);
+    if (promptAt !== -1) {
+      startOffset = promptAt + promptText.length;
     }
   }
 
-  const extractedRaw = scopedLines.slice(startLine).join("\n");
+  const extractedRaw = scoped.slice(startOffset);
   const lines = extractedRaw
     .split("\n")
     .map((line) => line.replace(/[ \t]+$/g, ""));
@@ -407,11 +393,11 @@ function settleAgentReply(): void {
   }
 }
 
-function scheduleAgentSettle(delayMs = AGENT_IDLE_SETTLE_MS): void {
+function scheduleAgentSettle(): void {
   clearAgentSettleTimer();
   agentSettleTimer = window.setTimeout(() => {
     settleAgentReply();
-  }, delayMs);
+  }, AGENT_SETTLE_MS);
 }
 
 function beginAgentReply(prompt: string): void {
@@ -422,12 +408,10 @@ function beginAgentReply(prompt: string): void {
   setStatus("Agent is thinking...", "loading");
 }
 
-function containsPromptBoundary(clean: string): boolean {
-  return /(?:^|\n)\s*nodepod:.*\$\s*$/im.test(clean);
-}
-
-function collectAgentOutput(clean: string): void {
+function collectAgentOutput(raw: string): void {
   if (!agentSessionStarted && !pendingStart) return;
+
+  const clean = normalizeAgentChunk(raw);
   if (!clean) return;
   updateSessionMetaFromChunk(clean);
 
@@ -442,7 +426,7 @@ function collectAgentOutput(clean: string): void {
     agentExtractCursor = Math.max(0, agentExtractCursor - overflow);
   }
 
-  scheduleAgentSettle(containsPromptBoundary(clean) ? AGENT_PROMPT_SETTLE_MS : AGENT_IDLE_SETTLE_MS);
+  scheduleAgentSettle();
 }
 
 function createDoneToken(prefix: string): string {
@@ -554,7 +538,8 @@ function handleStartTracking(clean: string): void {
   }
 }
 
-function handleWorkflowOutput(clean: string): void {
+function handleWorkflowOutput(raw: string): void {
+  const clean = normalizeAgentChunk(raw);
   if (!clean) return;
   handleStartTracking(clean);
 }
@@ -566,11 +551,8 @@ function wireTerminalOutputMirror(term: NodepodTerminal): void {
   const originalWriteOutput = t._writeOutput?.bind(t);
   if (typeof originalWriteOutput === "function") {
     t._writeOutput = (text: string, isError = false) => {
-      const clean = normalizeAgentChunk(String(text ?? ""));
-      if (clean) {
-        handleWorkflowOutput(clean);
-        collectAgentOutput(clean);
-      }
+      handleWorkflowOutput(String(text ?? ""));
+      collectAgentOutput(String(text ?? ""));
       return originalWriteOutput(text, isError);
     };
   }
