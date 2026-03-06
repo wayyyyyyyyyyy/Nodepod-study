@@ -7,6 +7,7 @@
 - Node.js and common Node package tools are available in the runtime.
 - Do not assume Python, apt, gcc, docker, or arbitrary system binaries are installed. Verify specific tool availability from actual command results.
 - Do not describe the environment to the user as a complete Linux system.
+- A project skill named `/skill:workspace-node` is available for more detailed Node.js workspace workflows when needed.
 - Use bash for short-lived validation commands such as tests, builds, lint, directory inspection, and one-off scripts.
 - Use workspace tools only for long-running commands such as Vite dev servers, watch mode, or other services that should keep running.
 - You may output at most one workspace directive block per reply, optionally after a normal user-facing explanation.

@@ -4,9 +4,12 @@ import {
   buildWorkspaceDirectiveFollowUp,
   extractWorkspaceDirective,
   isWorkspaceJobActive,
+  prepareWorkspaceNodeSkillPrompt,
   summarizeWorkspaceJob,
   truncateWorkspaceOutputTail,
   WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN,
+  WORKSPACE_NODE_SKILL_COMMAND,
+  WORKSPACE_NODE_SKILL_MARKDOWN,
 } from "../live-node-agent/workspace-tools";
 
 describe("workspace-tools", () => {
@@ -128,6 +131,47 @@ describe("workspace-tools", () => {
     expect(WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN).toContain("/workspace");
     expect(WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN).toContain("not a complete Linux environment");
     expect(WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN).toContain("Do not assume Python");
+    expect(WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN).toContain(WORKSPACE_NODE_SKILL_COMMAND);
+  });
+
+  it("prefixes the first normal user prompt with the workspace skill command", () => {
+    const prepared = prepareWorkspaceNodeSkillPrompt("Run the app and inspect package.json.", {
+      mode: "user",
+      alreadyPrimed: false,
+    });
+
+    expect(prepared.usedSkill).toBe(true);
+    expect(prepared.prompt.startsWith(`${WORKSPACE_NODE_SKILL_COMMAND}\n\n`)).toBe(true);
+  });
+
+  it("does not prepend the workspace skill once the session was primed", () => {
+    const prepared = prepareWorkspaceNodeSkillPrompt("npm test", {
+      mode: "user",
+      alreadyPrimed: true,
+    });
+
+    expect(prepared.usedSkill).toBe(false);
+    expect(prepared.prompt).toBe("npm test");
+  });
+
+  it("does not prepend the workspace skill to workspace follow-up prompts", () => {
+    const prepared = prepareWorkspaceNodeSkillPrompt("Workspace tool result: ...", {
+      mode: "workspace-tool",
+      alreadyPrimed: false,
+    });
+
+    expect(prepared.usedSkill).toBe(false);
+    expect(prepared.prompt).toBe("Workspace tool result: ...");
+  });
+
+  it("recognizes manual workspace skill usage without duplicating it", () => {
+    const prepared = prepareWorkspaceNodeSkillPrompt(`${WORKSPACE_NODE_SKILL_COMMAND}\nDo the task.`, {
+      mode: "user",
+      alreadyPrimed: false,
+    });
+
+    expect(prepared.usedSkill).toBe(true);
+    expect(prepared.prompt).toBe(`${WORKSPACE_NODE_SKILL_COMMAND}\nDo the task.`);
   });
 
   it("matches the checked-in .pi/APPEND_SYSTEM.md file", async () => {
@@ -136,5 +180,16 @@ describe("workspace-tools", () => {
     const fileContent = await readFile(resolve(process.cwd(), ".pi/APPEND_SYSTEM.md"), "utf8");
 
     expect(fileContent.trim()).toBe(WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN.trim());
+  });
+
+  it("matches the checked-in workspace skill file", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { resolve } = await import("node:path");
+    const fileContent = await readFile(
+      resolve(process.cwd(), ".pi/agent/skills/workspace-node/SKILL.md"),
+      "utf8",
+    );
+
+    expect(fileContent.trim()).toBe(WORKSPACE_NODE_SKILL_MARKDOWN.trim());
   });
 });

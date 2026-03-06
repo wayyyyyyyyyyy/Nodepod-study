@@ -4,11 +4,15 @@ import {
   buildWorkspaceDirectiveFollowUp,
   extractWorkspaceDirective,
   isWorkspaceJobActive,
+  prepareWorkspaceNodeSkillPrompt,
   summarizeWorkspaceJob,
   type WorkspaceDirective,
   type WorkspaceJobSnapshot,
   type WorkspaceJobStatus,
   WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN,
+  WORKSPACE_NODE_SKILL_DIRECTORY,
+  WORKSPACE_NODE_SKILL_MARKDOWN,
+  WORKSPACE_NODE_SKILL_RUNTIME_PATH,
 } from "../src/live-node-agent/workspace-tools";
 import { NODEPOD_SHELL_COMPAT_FILES } from "../src/live-node-agent/nodepod-shell-shims";
 import {
@@ -196,6 +200,7 @@ let activeRetryMessageEl: HTMLDivElement | null = null;
 let activeToolArgs: Record<string, unknown> | null = null;
 let pendingWorkspaceFollowUp = false;
 let workspaceDirectiveChainDepth = 0;
+let workspaceNodeSkillPrimed = false;
 let workspaceJobSeq = 0;
 const announcedPreviewPorts = new Set<number>();
 let workspaceJob: (WorkspaceJobSnapshot & {
@@ -424,6 +429,8 @@ async function ensureWorkspaceToolingInstructions(): Promise<void> {
   if (!nodepod) return;
   await nodepod.fs.mkdir("/workspace/.pi", { recursive: true });
   await nodepod.fs.writeFile(PI_AGENT_APPEND_SYSTEM_PATH, WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN);
+  await nodepod.fs.mkdir(WORKSPACE_NODE_SKILL_DIRECTORY, { recursive: true });
+  await nodepod.fs.writeFile(WORKSPACE_NODE_SKILL_RUNTIME_PATH, WORKSPACE_NODE_SKILL_MARKDOWN);
 }
 
 function sendCommand(command: string, terminalKind: TerminalKind = "agent"): void {
@@ -1096,6 +1103,7 @@ function stopAgentRpcProcess(resetSession = true): void {
   agentRpcNewSessionRequestId = null;
   pendingReconnect = false;
   pendingSessionReset = false;
+  workspaceNodeSkillPrimed = false;
   resetAgentStreamState();
 
   if (resetSession) {
@@ -1586,6 +1594,7 @@ function handleAgentRpcResponse(response: AgentRpcResponse): void {
 
     resetAgentStreamState();
     workspaceDirectiveChainDepth = 0;
+    workspaceNodeSkillPrimed = false;
     appendChatMessage("system", "Started a new agent session.");
     setStatus("New agent session started.", "success");
     try {
@@ -1897,6 +1906,7 @@ function finishStartSuccess(): void {
   pendingStart = false;
   pendingReconnect = false;
   workspaceDirectiveChainDepth = 0;
+  workspaceNodeSkillPrimed = false;
   clearStartWatchdog();
   updateStartButtonState();
   agentSessionStarted = true;
@@ -2280,8 +2290,16 @@ function sendAgentPromptFromInput(): void {
 
   appendChatMessage("user", prompt);
   workspaceDirectiveChainDepth = 0;
-  queueAgentPrompt(prompt, { mode: "user", statusText: "Agent is thinking..." });
-  cmdInput.value = "";
+  const preparedPrompt = prepareWorkspaceNodeSkillPrompt(prompt, {
+    mode: "user",
+    alreadyPrimed: workspaceNodeSkillPrimed,
+  });
+  if (queueAgentPrompt(preparedPrompt.prompt, { mode: "user", statusText: "Agent is thinking..." })) {
+    if (preparedPrompt.usedSkill) {
+      workspaceNodeSkillPrimed = true;
+    }
+    cmdInput.value = "";
+  }
 }
 
 appendChatMessage("system", "Setup: Install -> Env -> Start");
