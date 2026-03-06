@@ -1152,12 +1152,20 @@ async function bootRuntime(): Promise<void> {
       );
     }
 
-    agentTerminal = nodepod.createTerminal({ Terminal, FitAddon });
+    agentTerminal = nodepod.createTerminal({
+      Terminal,
+      FitAddon,
+      shareRuntimeCwd: false,
+    });
     agentTerminal.attach(agentTerminalEl);
     wireTerminalOutputMirror(agentTerminal);
     agentTerminal.showPrompt();
 
-    workspaceTerminal = nodepod.createTerminal({ Terminal, FitAddon });
+    workspaceTerminal = nodepod.createTerminal({
+      Terminal,
+      FitAddon,
+      shareRuntimeCwd: false,
+    });
     workspaceTerminal.attach(workspaceTerminalEl);
     workspaceTerminal.showPrompt();
 

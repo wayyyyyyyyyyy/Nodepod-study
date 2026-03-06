@@ -300,8 +300,10 @@ export class Nodepod {
   /* ---- createTerminal() ---- */
 
   createTerminal(opts: TerminalOptions): NodepodTerminal {
+    const shareRuntimeCwd = opts.shareRuntimeCwd ?? true;
     const terminal = new NodepodTerminal(opts);
-    terminal.setCwd(this._cwd);
+    let terminalCwd = this._cwd;
+    terminal.setCwd(terminalCwd);
 
     let activeAbort: AbortController | null = null;
     let currentSendStdin: ((data: string) => void) | null = null;
@@ -321,7 +323,7 @@ export class Nodepod {
       shellHandle = this._processManager.spawn({
         command: "shell",
         args: [],
-        cwd: this._cwd,
+        cwd: terminalCwd,
         env: this._baseEnv,
       });
       shellReady = new Promise<void>((resolve) => {
@@ -333,7 +335,10 @@ export class Nodepod {
       });
 
       shellHandle.on("cwd-change", (cwd: string) => {
-        this._cwd = cwd;
+        terminalCwd = cwd;
+        if (shareRuntimeCwd) {
+          this._cwd = cwd;
+        }
         terminal.setCwd(cwd);
       });
 
@@ -407,7 +412,7 @@ export class Nodepod {
           type: "exec",
           filePath: "",
           args: [],
-          cwd: this._cwd,
+          cwd: shareRuntimeCwd ? this._cwd : terminalCwd,
           env: this._baseEnv,
           isShell: true,
           shellCommand: cmd,

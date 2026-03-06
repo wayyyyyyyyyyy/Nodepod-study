@@ -46,6 +46,12 @@ export interface TerminalOptions {
   fontSize?: number;
   fontFamily?: string;
   prompt?: (cwd: string) => string;
+  /**
+   * Whether this terminal should keep using and mutating the runtime-level cwd.
+   * Defaults to true for backward compatibility. Set to false to isolate cwd
+   * changes to the terminal session itself.
+   */
+  shareRuntimeCwd?: boolean;
 }
 
 /* ---- Filesystem ---- */
