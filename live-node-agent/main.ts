@@ -10,6 +10,7 @@ import {
   type WorkspaceJobStatus,
   WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN,
 } from "../src/live-node-agent/workspace-tools";
+import { NODEPOD_SHELL_COMPAT_FILES } from "../src/live-node-agent/nodepod-shell-shims";
 import {
   chooseWorkspaceContinuationCommand,
   extractAssistantText,
@@ -2195,6 +2196,7 @@ async function bootRuntime(): Promise<void> {
         NODEPOD_CORS_PROXY_URL: corsProxyUrl,
       },
       files: {
+        ...NODEPOD_SHELL_COMPAT_FILES,
         "/workspace/package.json": JSON.stringify(
           {
             name: "browser-cli",

@@ -19,6 +19,7 @@ import type { VFSBridge } from "./vfs-bridge";
 import { PROCESS_WORKER_BUNDLE } from "virtual:process-worker-bundle";
 import { SLOT_SIZE } from "./sync-channel";
 import { TIMEOUTS } from "../constants/config";
+import { routeProcessExecution } from "../process-command-routing";
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
@@ -459,7 +460,6 @@ export class ProcessManager extends EventEmitter {
     });
 
     handle.on("spawn-request", (msg: WorkerToMain_SpawnRequest) => {
-      const fullCmd = msg.args.length ? `${msg.command} ${msg.args.join(" ")}` : msg.command;
       try {
         const childHandle = this.spawn({
           command: msg.command,
@@ -484,14 +484,15 @@ export class ProcessManager extends EventEmitter {
           pid: childHandle.pid,
         });
 
-        // Detect bare node commands and send as direct execution
-        const isNodeBin = /(?:^|\/)node$/.test(msg.command);
+        const execRoute = routeProcessExecution(this._volume, msg.command, msg.args, msg.cwd, {
+          trimNodeEntryArg: true,
+        });
         const sendExec = () => {
-          if (isNodeBin && msg.args.length > 0) {
+          if (execRoute.kind === "file") {
             childHandle.exec({
               type: "exec",
-              filePath: msg.args[0],
-              args: msg.args.slice(1),
+              filePath: execRoute.filePath,
+              args: execRoute.args,
               cwd: msg.cwd,
               env: msg.env,
               isShell: false,
@@ -504,7 +505,7 @@ export class ProcessManager extends EventEmitter {
               cwd: msg.cwd,
               env: msg.env,
               isShell: true,
-              shellCommand: fullCmd,
+              shellCommand: execRoute.shellCommand,
             });
           }
         };

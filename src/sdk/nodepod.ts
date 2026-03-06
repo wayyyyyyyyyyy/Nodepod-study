@@ -18,6 +18,7 @@ import type { ProcessHandle } from "../threading/process-handle";
 import { VFSBridge } from "../threading/vfs-bridge";
 import { isSharedArrayBufferAvailable, SharedVFSController } from "../threading/shared-vfs";
 import { SyncChannelController } from "../threading/sync-channel";
+import { routeProcessExecution } from "../process-command-routing";
 
 // Lazy-load child_process so the shell doesn't get pulled in at import time
 let _shellMod: typeof import("../polyfills/child_process") | null = null;
@@ -261,19 +262,17 @@ export class Nodepod {
       }
     });
 
-    const isNodeCmd = cmd === "node" && args?.length;
-    if (isNodeCmd) {
-      const filePath = this._resolveCommand(cmd, args, execCwd);
+    const execRoute = routeProcessExecution(this._volume, cmd, args ?? [], execCwd);
+    if (execRoute.kind === "file") {
       handle.exec({
         type: "exec",
-        filePath,
-        args: args ?? [],
+        filePath: execRoute.filePath,
+        args: execRoute.args,
         cwd: execCwd,
         env: mergedEnv,
         isShell: false,
       });
     } else {
-      const fullCmd = args?.length ? `${cmd} ${args.join(" ")}` : cmd;
       handle.exec({
         type: "exec",
         filePath: "",
@@ -281,22 +280,12 @@ export class Nodepod {
         cwd: execCwd,
         env: mergedEnv,
         isShell: true,
-        shellCommand: fullCmd,
+        shellCommand: execRoute.shellCommand,
       });
     }
 
     return proc;
   }
-
-  private _resolveCommand(cmd: string, args?: string[], baseCwd: string = this._cwd): string {
-    if (cmd === "node" && args?.length) {
-      const filePath = args[0];
-      if (filePath.startsWith("/")) return filePath;
-      return `${baseCwd}/${filePath}`.replace(/\/+/g, "/");
-    }
-    return cmd;
-  }
-
   /* ---- createTerminal() ---- */
 
   createTerminal(opts: TerminalOptions): NodepodTerminal {
