@@ -125,5 +125,16 @@ describe("workspace-tools", () => {
     expect(WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN).toContain("workspace_run");
     expect(WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN).toContain("workspace_status");
     expect(WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN).toContain("workspace_stop");
+    expect(WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN).toContain("/workspace");
+    expect(WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN).toContain("not a complete Linux environment");
+    expect(WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN).toContain("Do not assume Python");
+  });
+
+  it("matches the checked-in .pi/APPEND_SYSTEM.md file", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { resolve } = await import("node:path");
+    const fileContent = await readFile(resolve(process.cwd(), ".pi/APPEND_SYSTEM.md"), "utf8");
+
+    expect(fileContent.trim()).toBe(WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN.trim());
   });
 });
