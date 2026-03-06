@@ -7,15 +7,21 @@
     <link rel="stylesheet" href="/demo/styles.css" />
   </head>
   <body>
-    <main class="page">
-      <section class="workspace">
-        <aside class="sidebar">
-          <h2>Workspace</h2>
-          <div class="row">
-            <button id="refresh-files-btn" disabled>Refresh Files</button>
+	    <main class="page">
+	      <section class="workspace">
+	        <aside class="sidebar">
+	          <div class="sidebar-head">
+	            <h2>Workspace</h2>
+	            <p class="sidebar-sub">Browse runtime files and move data in or out.</p>
+	          </div>
+          <div class="row sidebar-actions">
+            <button id="upload-file-btn" disabled>Upload File</button>
+            <button id="download-file-btn" disabled>Download File</button>
           </div>
-          <div id="file-tree" class="file-tree">Boot runtime to load files.</div>
-        </aside>
+	          <div id="file-selection" class="file-selection">Selected: none</div>
+	          <div id="file-tree" class="file-tree">Boot runtime to load files.</div>
+	          <input id="file-upload-input" type="file" multiple hidden />
+	        </aside>
 
         <section class="card main-panel">
           <h1>LiveNode Agent</h1>
@@ -27,12 +33,15 @@
             <button id="start-agent-btn" disabled>3) Start CLI</button>
             <button id="toggle-terminal-btn" disabled>Show Terminal</button>
           </div>
-          <div class="status-bar">
-            <span id="status" class="status">Idle</span>
-            <span id="session-meta" class="session-meta">Session info will appear here.</span>
-          </div>
+	          <div class="status-bar">
+	            <span id="status" class="status">Idle</span>
+	            <span id="session-meta" class="session-meta">Session info will appear here.</span>
+	          </div>
 
-          <section id="chat-log" class="chat-log" aria-live="polite"></section>
+	          <div class="chat-section-head">
+	            <span class="chat-section-kicker">Conversation</span>
+	          </div>
+	          <section id="chat-log" class="chat-log" aria-live="polite"></section>
 
           <div class="row chat-input-row">
             <input
@@ -94,7 +103,7 @@
             spellcheck="false"
           />
         </label>
-        <div class="row">
+        <div class="row env-actions">
           <button id="env-submit-btn" type="submit">Confirm Env</button>
           <button id="env-cancel-btn" type="button">Cancel</button>
         </div>

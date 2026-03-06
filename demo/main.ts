@@ -11,7 +11,10 @@ const startAgentBtn = document.querySelector("#start-agent-btn") as HTMLButtonEl
 const toggleTerminalBtn = document.querySelector("#toggle-terminal-btn") as HTMLButtonElement;
 const runBtn = document.querySelector("#run-btn") as HTMLButtonElement;
 const clearBtn = document.querySelector("#clear-btn") as HTMLButtonElement;
-const refreshFilesBtn = document.querySelector("#refresh-files-btn") as HTMLButtonElement;
+const uploadFileBtn = document.querySelector("#upload-file-btn") as HTMLButtonElement;
+const downloadFileBtn = document.querySelector("#download-file-btn") as HTMLButtonElement;
+const fileSelectionEl = document.querySelector("#file-selection") as HTMLDivElement;
+const fileUploadInput = document.querySelector("#file-upload-input") as HTMLInputElement;
 const cmdInput = document.querySelector("#cmd-input") as HTMLInputElement;
 const chatLogEl = document.querySelector("#chat-log") as HTMLDivElement;
 const terminalPanelEl = document.querySelector("#terminal-panel") as HTMLElement;
@@ -29,7 +32,9 @@ const DEFAULT_MODEL_ID = "kimi-k2-turbo-preview";
 const MAX_TREE_DEPTH = 4;
 const MAX_DIR_ITEMS = 80;
 const SKIP_RECURSE_DIRS = new Set(["node_modules", ".git"]);
-const AGENT_SETTLE_MS = 4500;
+const FILE_TREE_AUTO_REFRESH_MS = 12000;
+const AGENT_REPLY_IDLE_MS = 1200;
+const AGENT_REPLY_RECHECK_MS = 300;
 const AGENT_STREAM_BUFFER_LIMIT = 120000;
 const AGENT_NOISE_PATTERNS: RegExp[] = [
   /^escape to interrupt$/i,
@@ -105,11 +110,29 @@ let awaitingAgentReply = false;
 let agentEscapeCarry = "";
 let lastUserPrompt = "";
 let agentExtractCursor = 0;
+let agentReplyStartedAt = 0;
+let selectedTreePath: string | null = null;
+let selectedTreeIsDirectory = false;
+let fileTreeRefreshInFlight = false;
+let fileTreeAutoRefreshTimer: number | null = null;
 const sessionMeta: SessionMeta = {
   cwd: "",
   usage: "",
   model: "",
 };
+
+function updateChatControlsState(): void {
+  cmdInput.disabled = !agentSessionStarted;
+  runBtn.disabled = !agentSessionStarted || awaitingAgentReply;
+}
+
+function updateFileActionState(): void {
+  uploadFileBtn.disabled = !nodepod;
+  downloadFileBtn.disabled = !nodepod || !selectedTreePath || selectedTreeIsDirectory;
+  fileSelectionEl.textContent = selectedTreePath
+    ? `Selected: ${selectedTreePath}${selectedTreeIsDirectory ? " (directory)" : ""}`
+    : "Selected: none";
+}
 
 function updateStartButtonState(): void {
   startAgentBtn.disabled = !(!!appliedConfig && installReady && !pendingStart && !pendingInstallSentinelPath);
@@ -228,6 +251,45 @@ function appendChatMessage(role: "system" | "user" | "agent", text: string): HTM
   return message;
 }
 
+function sanitizeUploadName(name: string): string {
+  return name.replace(/[\\/]+/g, "-").trim() || "upload.bin";
+}
+
+function joinFsPath(base: string, child: string): string {
+  return `${base.replace(/\/+$/, "")}/${child.replace(/^\/+/, "")}`.replace(/\/{2,}/g, "/");
+}
+
+function dirname(path: string): string {
+  const normalized = path.replace(/\/+$/, "");
+  const index = normalized.lastIndexOf("/");
+  if (index <= 0) return "/";
+  return normalized.slice(0, index);
+}
+
+function setSelectedTreeNode(path: string | null, isDirectory = false): void {
+  selectedTreePath = path;
+  selectedTreeIsDirectory = !!path && isDirectory;
+
+  fileTreeEl.querySelectorAll<HTMLElement>("[data-tree-selected='true']").forEach((el) => {
+    el.dataset.treeSelected = "false";
+  });
+
+  if (path) {
+    const selector = `[data-tree-path="${CSS.escape(path)}"]`;
+    const active = fileTreeEl.querySelector<HTMLElement>(selector);
+    if (active) active.dataset.treeSelected = "true";
+  }
+
+  updateFileActionState();
+}
+
+function startFileTreeAutoRefresh(): void {
+  if (fileTreeAutoRefreshTimer !== null) return;
+  fileTreeAutoRefreshTimer = window.setInterval(() => {
+    void refreshFileTree({ silent: true });
+  }, FILE_TREE_AUTO_REFRESH_MS);
+}
+
 function clearAgentSettleTimer(): void {
   if (agentSettleTimer !== null) {
     window.clearTimeout(agentSettleTimer);
@@ -283,11 +345,27 @@ function resetAgentStreamState(): void {
   lastUserPrompt = "";
   agentEscapeCarry = "";
   agentExtractCursor = 0;
+  agentReplyStartedAt = 0;
 }
 
 function shouldIgnoreAgentLine(trimmedLine: string): boolean {
   if (!trimmedLine) return true;
   return AGENT_NOISE_PATTERNS.some((pattern) => pattern.test(trimmedLine));
+}
+
+function isLikelyIncrementalFrame(prevRaw: string, nextRaw: string): boolean {
+  const prev = prevRaw.trim();
+  const next = nextRaw.trim();
+  if (!prev || !next) return false;
+
+  if (/^\s*[-*]\s/.test(prevRaw) || /^\s*[-*]\s/.test(nextRaw)) return false;
+
+  const shorter = prev.length <= next.length ? prev : next;
+  const longer = prev.length <= next.length ? next : prev;
+  if (!longer.startsWith(shorter)) return false;
+
+  const delta = longer.length - shorter.length;
+  return delta > 0 && delta <= 24;
 }
 
 function normalizeExtractedLines(lines: string[], promptText: string): string {
@@ -317,13 +395,7 @@ function normalizeExtractedLines(lines: string[], promptText: string): string {
     if (!line && !prev) continue;
     if (line === prev) continue;
 
-    // Collapse TUI incremental redraw frames:
-    // "我是Pi" -> "我是Pi," -> "我是Pi, 一个..." keeps only the latest/longest frame.
-    if (
-      (line.startsWith(prev) || prev.startsWith(line)) &&
-      line.length <= prev.length + 220 &&
-      prev.length <= line.length + 220
-    ) {
+    if (isLikelyIncrementalFrame(prevRaw, rawLine)) {
       deduped[deduped.length - 1] = line.length >= prev.length ? rawLine : prevRaw;
       continue;
     }
@@ -348,15 +420,19 @@ function extractFinalAgentText(
     return { text: "", nextCursor: transcript.length };
   }
 
-  let startOffset = 0;
+  const scopedLines = scoped.split("\n");
+  let startLine = 0;
   if (promptText) {
-    const promptAt = scoped.indexOf(promptText);
-    if (promptAt !== -1) {
-      startOffset = promptAt + promptText.length;
+    const promptLineAt = scopedLines.findIndex((line, idx) => idx < 8 && line.trim() === promptText);
+    if (promptLineAt !== -1) {
+      startLine = promptLineAt + 1;
+      while (startLine < scopedLines.length && scopedLines[startLine].trim() === "") {
+        startLine += 1;
+      }
     }
   }
 
-  const extractedRaw = scoped.slice(startOffset);
+  const extractedRaw = scopedLines.slice(startLine).join("\n");
   const lines = extractedRaw
     .split("\n")
     .map((line) => line.replace(/[ \t]+$/g, ""));
@@ -364,18 +440,82 @@ function extractFinalAgentText(
   return { text, nextCursor: transcript.length };
 }
 
+function readVisibleTerminalText(): string {
+  const xterm = terminal?.xterm as any;
+  const active = xterm?.buffer?.active;
+  if (!xterm || !active) return "";
+
+  const rows = typeof xterm.rows === "number" ? xterm.rows : 24;
+  const viewportY =
+    typeof active.viewportY === "number"
+      ? active.viewportY
+      : typeof active.ydisp === "number"
+        ? active.ydisp
+        : Math.max(0, (active.length ?? rows) - rows);
+  const start = Math.max(0, viewportY);
+  const end = Math.min((active.length ?? rows) - 1, start + rows - 1);
+  const lines: string[] = [];
+
+  for (let index = start; index <= end; index += 1) {
+    const line = active.getLine(index);
+    if (!line) continue;
+    lines.push(String(line.translateToString(true) ?? "").replace(/[ \t]+$/g, ""));
+  }
+
+  return lines.join("\n").trim();
+}
+
+function terminalReplyStillWorking(screenText: string): boolean {
+  return /(?:^|\n)\s*[⠋⠙⠧⠹⠸⠼⠴⠦⠇⠏]?\s*Working\.\.\.(?:\n|$)/i.test(screenText);
+}
+
+function extractFinalAgentTextFromScreen(screenText: string, prompt: string): string {
+  if (!screenText.trim()) return "";
+  const promptText = prompt.trim();
+  const lines = screenText.split("\n").map((line) => line.replace(/[ \t]+$/g, ""));
+
+  if (!promptText) {
+    return normalizeExtractedLines(lines, "");
+  }
+
+  let startLine = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (lines[index].trim() === promptText) {
+      startLine = index + 1;
+      break;
+    }
+  }
+
+  if (startLine === -1) return "";
+  return normalizeExtractedLines(lines.slice(startLine), promptText);
+}
+
 function settleAgentReply(): void {
   if (!awaitingAgentReply) return;
+
+  const screenText = readVisibleTerminalText();
+  if (terminalReplyStillWorking(screenText) && Date.now() - agentReplyStartedAt < 30000) {
+    clearAgentSettleTimer();
+    agentSettleTimer = window.setTimeout(() => {
+      settleAgentReply();
+    }, AGENT_REPLY_RECHECK_MS);
+    return;
+  }
+
   awaitingAgentReply = false;
   clearAgentSettleTimer();
+  updateChatControlsState();
 
+  const screenTextReply = extractFinalAgentTextFromScreen(screenText, lastUserPrompt);
   const { text: finalText, nextCursor } = extractFinalAgentText(
     agentTranscript,
     agentExtractCursor,
     lastUserPrompt,
   );
-  if (finalText) {
-    appendChatMessage("agent", finalText);
+  const resolvedReply = screenTextReply || finalText;
+
+  if (resolvedReply) {
+    appendChatMessage("agent", resolvedReply);
   } else if (agentTranscript.trim()) {
     const fallback = agentTranscript
       .split("\n")
@@ -397,21 +537,21 @@ function scheduleAgentSettle(): void {
   clearAgentSettleTimer();
   agentSettleTimer = window.setTimeout(() => {
     settleAgentReply();
-  }, AGENT_SETTLE_MS);
+  }, AGENT_REPLY_IDLE_MS);
 }
 
 function beginAgentReply(prompt: string): void {
   awaitingAgentReply = true;
+  agentReplyStartedAt = Date.now();
   lastUserPrompt = prompt.trim();
   agentEscapeCarry = "";
   clearAgentSettleTimer();
+  updateChatControlsState();
   setStatus("Agent is thinking...", "loading");
 }
 
-function collectAgentOutput(raw: string): void {
+function collectAgentOutput(clean: string): void {
   if (!agentSessionStarted && !pendingStart) return;
-
-  const clean = normalizeAgentChunk(raw);
   if (!clean) return;
   updateSessionMetaFromChunk(clean);
 
@@ -501,6 +641,7 @@ function finishStartSuccess(): void {
   updateStartButtonState();
   agentSessionStarted = true;
   resetAgentStreamState();
+  updateChatControlsState();
   setStatus("Agent CLI started.", "success");
   appendChatMessage("system", "Agent CLI started. You can chat below.");
 }
@@ -512,6 +653,7 @@ function finishStartError(message: string): void {
   updateStartButtonState();
   agentSessionStarted = false;
   resetAgentStreamState();
+  updateChatControlsState();
   setStatus(message, "error");
   appendChatMessage("system", message);
 }
@@ -538,8 +680,7 @@ function handleStartTracking(clean: string): void {
   }
 }
 
-function handleWorkflowOutput(raw: string): void {
-  const clean = normalizeAgentChunk(raw);
+function handleWorkflowOutput(clean: string): void {
   if (!clean) return;
   handleStartTracking(clean);
 }
@@ -551,8 +692,11 @@ function wireTerminalOutputMirror(term: NodepodTerminal): void {
   const originalWriteOutput = t._writeOutput?.bind(t);
   if (typeof originalWriteOutput === "function") {
     t._writeOutput = (text: string, isError = false) => {
-      handleWorkflowOutput(String(text ?? ""));
-      collectAgentOutput(String(text ?? ""));
+      const clean = normalizeAgentChunk(String(text ?? ""));
+      if (clean) {
+        handleWorkflowOutput(clean);
+        collectAgentOutput(clean);
+      }
       return originalWriteOutput(text, isError);
     };
   }
@@ -685,9 +829,13 @@ function renderTreeNode(node: TreeNode): HTMLLIElement {
   const li = document.createElement("li");
 
   if (!node.isDirectory) {
-    const file = document.createElement("span");
-    file.className = "tree-file";
+    const file = document.createElement("button");
+    file.type = "button";
+    file.className = "tree-file tree-entry";
     file.textContent = node.name;
+    file.dataset.treePath = node.path;
+    file.dataset.treeDirectory = "false";
+    file.dataset.treeSelected = selectedTreePath === node.path ? "true" : "false";
     li.appendChild(file);
     return li;
   }
@@ -696,10 +844,13 @@ function renderTreeNode(node: TreeNode): HTMLLIElement {
   details.open = node.path === "/workspace" || node.path === "/home/user/.pi/agent";
 
   const summary = document.createElement("summary");
-  summary.className = "tree-dir";
+  summary.className = "tree-dir tree-entry";
   summary.textContent = `${node.name}/`;
   if (node.skipped) summary.textContent += " (skipped)";
   if (node.truncated) summary.textContent += " (truncated)";
+  summary.dataset.treePath = node.path;
+  summary.dataset.treeDirectory = "true";
+  summary.dataset.treeSelected = selectedTreePath === node.path ? "true" : "false";
   details.appendChild(summary);
 
   if (node.children && node.children.length > 0) {
@@ -714,46 +865,113 @@ function renderTreeNode(node: TreeNode): HTMLLIElement {
   return li;
 }
 
-async function refreshFileTree(): Promise<void> {
+async function refreshFileTree(options: { silent?: boolean } = {}): Promise<void> {
+  const { silent = false } = options;
   if (!nodepod) {
     fileTreeEl.textContent = "Boot runtime to load files.";
+    updateFileActionState();
     return;
   }
 
-  refreshFilesBtn.disabled = true;
-  fileTreeEl.textContent = "Loading files...";
+  if (fileTreeRefreshInFlight) return;
+  fileTreeRefreshInFlight = true;
+
+  if (!silent && fileTreeEl.childElementCount === 0) {
+    fileTreeEl.textContent = "Loading files...";
+  }
 
   const roots = ["/workspace", "/home/user/.pi/agent"];
   const nodes: TreeNode[] = [];
 
-  for (const root of roots) {
-    const tree = await readTreeNode(root, MAX_TREE_DEPTH);
-    if (tree) nodes.push(tree);
-  }
-
-  fileTreeEl.innerHTML = "";
-  if (nodes.length === 0) {
-    fileTreeEl.textContent = "No files found in selected roots.";
-  } else {
-    const ul = document.createElement("ul");
-    for (const node of nodes) {
-      const li = document.createElement("li");
-      li.className = "tree-root";
-      li.textContent = node.path;
-      ul.appendChild(li);
-
-      const inner = document.createElement("ul");
-      if (node.children) {
-        for (const child of node.children) {
-          inner.appendChild(renderTreeNode(child));
-        }
-      }
-      ul.appendChild(inner);
+  try {
+    for (const root of roots) {
+      const tree = await readTreeNode(root, MAX_TREE_DEPTH);
+      if (tree) nodes.push(tree);
     }
-    fileTreeEl.appendChild(ul);
+
+    fileTreeEl.innerHTML = "";
+    if (nodes.length === 0) {
+      fileTreeEl.textContent = "No files found in selected roots.";
+    } else {
+      const ul = document.createElement("ul");
+      for (const node of nodes) {
+        const li = document.createElement("li");
+        const root = document.createElement("button");
+        root.type = "button";
+        root.className = "tree-root tree-entry";
+        root.textContent = node.path;
+        root.dataset.treePath = node.path;
+        root.dataset.treeDirectory = "true";
+        root.dataset.treeSelected = selectedTreePath === node.path ? "true" : "false";
+        li.appendChild(root);
+        ul.appendChild(li);
+
+        const inner = document.createElement("ul");
+        if (node.children) {
+          for (const child of node.children) {
+            inner.appendChild(renderTreeNode(child));
+          }
+        }
+        ul.appendChild(inner);
+      }
+      fileTreeEl.appendChild(ul);
+    }
+
+    if (selectedTreePath && !fileTreeEl.querySelector(`[data-tree-path="${CSS.escape(selectedTreePath)}"]`)) {
+      setSelectedTreeNode(null, false);
+    }
+
+    updateFileActionState();
+  } finally {
+    fileTreeRefreshInFlight = false;
+  }
+}
+
+async function uploadFilesToRuntime(files: FileList | null): Promise<void> {
+  if (!nodepod || !files || files.length === 0) return;
+
+  const targetDir = selectedTreePath
+    ? selectedTreeIsDirectory
+      ? selectedTreePath
+      : dirname(selectedTreePath)
+    : "/workspace";
+
+  setStatus(`Uploading ${files.length} file${files.length > 1 ? "s" : ""}...`, "loading");
+  for (const file of Array.from(files)) {
+    const fileName = sanitizeUploadName(file.name);
+    const targetPath = joinFsPath(targetDir, fileName);
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    await nodepod.fs.writeFile(targetPath, bytes);
   }
 
-  refreshFilesBtn.disabled = false;
+  const firstFileName = sanitizeUploadName(files[0].name);
+  setStatus("Upload completed.", "success");
+  appendChatMessage("system", `Uploaded ${files.length} file${files.length > 1 ? "s" : ""} to ${targetDir}.`);
+  await refreshFileTree({ silent: true });
+  setSelectedTreeNode(joinFsPath(targetDir, firstFileName), false);
+}
+
+async function downloadSelectedFile(): Promise<void> {
+  if (!nodepod || !selectedTreePath || selectedTreeIsDirectory) return;
+
+  try {
+    const content = await nodepod.fs.readFile(selectedTreePath);
+    const bytes = content instanceof Uint8Array ? content : new TextEncoder().encode(content);
+    const blob = new Blob([bytes]);
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = selectedTreePath.split("/").pop() || "download";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    setStatus("Download started.", "success");
+    await refreshFileTree({ silent: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    setStatus(`Download failed: ${message}`, "error");
+  }
 }
 
 async function bootRuntime(): Promise<void> {
@@ -794,11 +1012,13 @@ async function bootRuntime(): Promise<void> {
     applyEnvBtn.disabled = false;
     updateStartButtonState();
     toggleTerminalBtn.disabled = false;
-    runBtn.disabled = false;
     clearBtn.disabled = false;
-    refreshFilesBtn.disabled = false;
+    uploadFileBtn.disabled = false;
+    updateChatControlsState();
+    updateFileActionState();
 
     await refreshFileTree();
+    startFileTreeAutoRefresh();
     setStatus("Runtime booted.", "success");
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -827,9 +1047,32 @@ appendChatMessage("system", "Use this chat box as the main interaction pane.");
 setStatus("Idle", "idle");
 renderSessionMeta();
 updateStartButtonState();
+updateChatControlsState();
+updateFileActionState();
 
-refreshFilesBtn.addEventListener("click", () => {
-  void refreshFileTree();
+fileTreeEl.addEventListener("click", (event) => {
+  const target = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-tree-path]");
+  if (!target) return;
+  const path = target.dataset.treePath;
+  if (!path) return;
+  setSelectedTreeNode(path, target.dataset.treeDirectory === "true");
+});
+
+uploadFileBtn.addEventListener("click", () => {
+  if (!nodepod) {
+    setStatus("Boot runtime first.", "idle");
+    return;
+  }
+  fileUploadInput.value = "";
+  fileUploadInput.click();
+});
+
+fileUploadInput.addEventListener("change", () => {
+  void uploadFilesToRuntime(fileUploadInput.files);
+});
+
+downloadFileBtn.addEventListener("click", () => {
+  void downloadSelectedFile();
 });
 
 toggleTerminalBtn.addEventListener("click", () => {
