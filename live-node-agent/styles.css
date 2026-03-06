@@ -665,6 +665,23 @@ button:disabled {
   color: #a26812;
 }
 
+.chat-message.system[data-system-kind="error"] {
+  background:
+    linear-gradient(135deg, rgba(255, 236, 234, 0.99), rgba(255, 244, 243, 0.96)),
+    radial-gradient(120% 120% at 0% 0%, rgba(255, 140, 127, 0.16), transparent 46%);
+  border-color: rgba(232, 128, 112, 0.34);
+  border-left-color: rgba(219, 81, 69, 0.7);
+  box-shadow:
+    0 14px 30px rgba(188, 132, 121, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.56);
+  color: rgba(88, 33, 28, 0.96);
+}
+
+.chat-message.system[data-system-kind="error"]::before {
+  content: attr(data-system-label);
+  color: #b24b3d;
+}
+
 .chat-input-row {
   gap: 8px;
 }

@@ -86,7 +86,8 @@ type PreviewTarget = {
 };
 
 type TerminalKind = "agent" | "workspace";
-type SystemMessageKind = "tool" | "retry";
+type SystemMessageKind = "tool" | "retry" | "error";
+type SystemErrorKind = "auth" | "startup" | "rpc" | "tool" | "extension" | "runtime";
 
 type AgentRpcRequest =
   | { id: string; type: "get_state" | "new_session" }
@@ -343,6 +344,66 @@ function appendSystemStatusMessage(
   const message = appendChatMessage("system", text);
   setSystemMessageVariant(message, kind, label);
   return message;
+}
+
+function formatErrorLabel(kind: SystemErrorKind): string {
+  switch (kind) {
+    case "auth":
+      return "Error · Auth";
+    case "startup":
+      return "Error · Startup";
+    case "rpc":
+      return "Error · RPC";
+    case "tool":
+      return "Error · Tool";
+    case "extension":
+      return "Error · Extension";
+    default:
+      return "Error · Runtime";
+  }
+}
+
+function classifyErrorKind(message: string, fallback: SystemErrorKind): SystemErrorKind {
+  const normalized = message.toLowerCase();
+
+  if (
+    normalized.includes("401") ||
+    normalized.includes("authentication") ||
+    normalized.includes("invalid auth") ||
+    normalized.includes("api key") ||
+    normalized.includes("unauthorized") ||
+    normalized.includes("expired")
+  ) {
+    return "auth";
+  }
+
+  if (normalized.includes("extension")) {
+    return "extension";
+  }
+
+  if (
+    normalized.includes("startup") ||
+    normalized.includes("start agent") ||
+    normalized.includes("exited early") ||
+    normalized.includes("startup timeout")
+  ) {
+    return "startup";
+  }
+
+  if (
+    normalized.includes("rpc") ||
+    normalized.includes("process is not running") ||
+    normalized.includes("session is not running")
+  ) {
+    return "rpc";
+  }
+
+  return fallback;
+}
+
+function appendErrorMessage(message: string, fallback: SystemErrorKind): HTMLDivElement {
+  const kind = classifyErrorKind(message, fallback);
+  return appendSystemStatusMessage(message, "error", formatErrorLabel(kind));
 }
 
 function sanitizeUploadName(name: string): string {
@@ -673,6 +734,16 @@ function closeToolActivityMessage(text: string, toolName = "tool"): void {
   activeToolMessageEl = null;
 }
 
+function closeToolErrorMessage(text: string): void {
+  if (!activeToolMessageEl) {
+    appendErrorMessage(text, "tool");
+    return;
+  }
+  setSystemMessageVariant(activeToolMessageEl, "error", formatErrorLabel("tool"));
+  updateChatMessage(activeToolMessageEl, text);
+  activeToolMessageEl = null;
+}
+
 function setRetryActivityMessage(text: string): void {
   if (!activeRetryMessageEl) {
     activeRetryMessageEl = appendSystemStatusMessage(text, "retry", "Retry");
@@ -746,7 +817,7 @@ function beginSessionReset(): void {
     agentRpcNewSessionRequestId = null;
     updateChatControlsState();
     const message = err instanceof Error ? err.message : String(err);
-    appendChatMessage("system", message);
+    appendErrorMessage(message, "rpc");
     setStatus(message, "error");
   }
 }
@@ -796,7 +867,7 @@ function finalizeAgentReply(messages?: any[]): void {
   if (finalText) {
     appendChatMessage("agent", finalText);
   } else {
-    appendChatMessage("system", "Agent finished without a text reply.");
+    appendSystemStatusMessage("Agent finished without a text reply.", "retry", "Reply");
   }
   setStatus("Agent ready.", "success");
 }
@@ -865,7 +936,7 @@ function handleAgentRpcEvent(event: AgentRpcEvent): void {
         const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
         if (event.isError) {
           const summary = summarizeToolFailure(toolName, activeToolArgs ?? undefined, event.result);
-          closeToolActivityMessage(summary, toolName);
+          closeToolErrorMessage(summary);
           setStatus(summary, "error");
         } else {
           closeToolActivityMessage(
@@ -899,7 +970,7 @@ function handleAgentRpcEvent(event: AgentRpcEvent): void {
       break;
     case "extension_error":
       if (typeof event.error === "string") {
-        appendChatMessage("system", `Extension error: ${event.error}`);
+        appendErrorMessage(`Extension error: ${event.error}`, "extension");
       }
       break;
     case "agent_end":
@@ -939,7 +1010,7 @@ function handleAgentRpcResponse(response: AgentRpcResponse): void {
 
     if (!response.success) {
       const message = response.error?.message || "Failed to start a new agent session.";
-      appendChatMessage("system", message);
+      appendErrorMessage(message, "rpc");
       setStatus(message, "error");
       return;
     }
@@ -978,7 +1049,7 @@ function handleAgentRpcResponse(response: AgentRpcResponse): void {
     if (!response.success) {
       const message = response.error?.message || "Agent request failed.";
       resetAgentStreamState();
-      appendChatMessage("system", message);
+      appendErrorMessage(message, "rpc");
       setStatus(message, "error");
     }
   }
@@ -1104,7 +1175,7 @@ function queueAgentPrompt(prompt: string): void {
   } catch (err) {
     resetAgentStreamState();
     const message = err instanceof Error ? err.message : String(err);
-    appendChatMessage("system", message);
+    appendErrorMessage(message, "rpc");
     setStatus(message, "error");
   }
 }
@@ -1147,7 +1218,7 @@ async function startAgentRpcSession(config: AgentConfig): Promise<void> {
       return;
     }
     if (exitedDuringReply) {
-      appendChatMessage("system", `Agent process exited unexpectedly (code ${code}).`);
+      appendErrorMessage(`Agent process exited unexpectedly (code ${code}).`, "rpc");
     }
     if (wasCurrent) {
       setStatus(`Agent process stopped (exit ${code}).`, code === 0 ? "idle" : "error");
@@ -1249,7 +1320,7 @@ function finishStartError(message: string): void {
   resetAgentStreamState();
   updateChatControlsState();
   setStatus(message, "error");
-  appendChatMessage("system", message);
+  appendErrorMessage(message, "startup");
 }
 
 function setTerminalVisible(nextVisible: boolean): void {
