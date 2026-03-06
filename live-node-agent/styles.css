@@ -13,6 +13,22 @@
   --accent-strong: #0d8f93;
   --accent-soft: rgba(23, 192, 181, 0.14);
   --warn: #d16d4e;
+  --btn-session-from: rgba(107, 128, 154, 0.96);
+  --btn-session-to: rgba(74, 91, 115, 0.96);
+  --btn-session-shadow: rgba(74, 91, 115, 0.2);
+  --btn-session-glow: rgba(130, 160, 198, 0.12);
+  --btn-primary-from: rgba(24, 170, 186, 0.96);
+  --btn-primary-to: rgba(8, 112, 122, 0.94);
+  --btn-primary-shadow: rgba(6, 89, 104, 0.24);
+  --btn-primary-glow: rgba(23, 192, 181, 0.14);
+  --btn-utility-from: rgba(76, 105, 142, 0.96);
+  --btn-utility-to: rgba(47, 69, 102, 0.96);
+  --btn-utility-shadow: rgba(58, 81, 118, 0.22);
+  --btn-utility-glow: rgba(107, 188, 255, 0.12);
+  --btn-danger-from: rgba(181, 102, 102, 0.95);
+  --btn-danger-to: rgba(140, 72, 72, 0.95);
+  --btn-danger-shadow: rgba(140, 72, 72, 0.22);
+  --btn-danger-glow: rgba(227, 127, 127, 0.12);
   --chat-bg:
     linear-gradient(180deg, rgba(255, 255, 255, 0.96) 0%, rgba(243, 249, 255, 0.92) 100%);
   --chat-agent: #163251;
@@ -187,7 +203,7 @@ h1 {
 
 .sidebar-actions button {
   width: 100%;
-  padding-inline: 12px;
+  padding-inline: 10px;
 }
 
 input {
@@ -195,27 +211,32 @@ input {
 }
 
 button {
+  --btn-from: var(--btn-session-from);
+  --btn-to: var(--btn-session-to);
+  --btn-shadow: var(--btn-session-shadow);
+  --btn-glow: var(--btn-session-glow);
   border: 1px solid rgba(132, 244, 255, 0.18);
   color: #ffffff;
   border-radius: 14px;
-  padding: 11px 16px;
-  font-weight: 640;
+  padding: 8px 12px;
+  min-height: 40px;
+  font-size: 13px;
+  font-weight: 620;
   letter-spacing: 0.01em;
   cursor: pointer;
-  background:
-    linear-gradient(180deg, rgba(24, 170, 186, 0.96) 0%, rgba(8, 112, 122, 0.94) 100%);
+  background: linear-gradient(180deg, var(--btn-from) 0%, var(--btn-to) 100%);
   box-shadow:
-    0 14px 28px rgba(6, 89, 104, 0.28),
-    inset 0 1px 0 rgba(215, 255, 255, 0.2);
+    0 14px 28px var(--btn-shadow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
   transition: transform 120ms ease, box-shadow 180ms ease, opacity 180ms ease;
 }
 
 button:hover:not(:disabled) {
   transform: translateY(-1px);
   box-shadow:
-    0 18px 34px rgba(6, 89, 104, 0.38),
-    0 0 22px rgba(23, 192, 181, 0.14),
-    inset 0 1px 0 rgba(255, 255, 255, 0.3);
+    0 18px 34px color-mix(in srgb, var(--btn-shadow) 82%, rgba(12, 18, 28, 0.16)),
+    0 0 20px var(--btn-glow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22);
 }
 
 button:active:not(:disabled) {
@@ -229,32 +250,36 @@ button:disabled {
   box-shadow: none;
 }
 
-#toggle-terminal-btn {
-  background: linear-gradient(180deg, rgba(48, 63, 83, 0.96) 0%, rgba(29, 40, 55, 0.96) 100%);
+#install-btn,
+#apply-env-btn,
+#start-agent-btn,
+#upload-file-btn,
+#download-file-btn,
+#run-btn,
+#open-preview-btn,
+#env-submit-btn {
+  --btn-from: var(--btn-primary-from);
+  --btn-to: var(--btn-primary-to);
+  --btn-shadow: var(--btn-primary-shadow);
+  --btn-glow: var(--btn-primary-glow);
 }
 
-#new-session-btn {
-  background: linear-gradient(180deg, rgba(107, 128, 154, 0.96) 0%, rgba(74, 91, 115, 0.96) 100%);
-}
-
-#stop-session-btn {
-  background: linear-gradient(180deg, rgba(181, 102, 102, 0.95) 0%, rgba(140, 72, 72, 0.95) 100%);
-}
-
-#reconnect-session-btn {
-  background: linear-gradient(180deg, rgba(96, 128, 165, 0.96) 0%, rgba(63, 92, 129, 0.96) 100%);
-}
-
-#clear-conversation-btn {
-  background: linear-gradient(180deg, rgba(125, 138, 154, 0.95) 0%, rgba(89, 101, 118, 0.95) 100%);
-}
-
-#clear-btn {
-  background: linear-gradient(180deg, rgba(232, 127, 70, 0.95) 0%, rgba(189, 91, 46, 0.95) 100%);
-}
-
+#toggle-preview-btn,
+#toggle-terminal-btn,
+#clear-btn,
 #env-cancel-btn {
-  background: linear-gradient(180deg, rgba(87, 99, 117, 0.96) 0%, rgba(58, 67, 83, 0.96) 100%);
+  --btn-from: var(--btn-utility-from);
+  --btn-to: var(--btn-utility-to);
+  --btn-shadow: var(--btn-utility-shadow);
+  --btn-glow: var(--btn-utility-glow);
+}
+
+#stop-session-btn,
+#clear-conversation-btn {
+  --btn-from: var(--btn-danger-from);
+  --btn-to: var(--btn-danger-to);
+  --btn-shadow: var(--btn-danger-shadow);
+  --btn-glow: var(--btn-danger-glow);
 }
 
 .status-bar {
@@ -274,10 +299,31 @@ button:disabled {
 
 .chat-section-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   padding: 2px 2px 0;
+}
+
+.conversation-tools {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.panel-toggle {
+  border-radius: 14px;
+  padding: 11px 16px;
+  font-size: inherit;
+  font-weight: 640;
+  letter-spacing: 0.01em;
+}
+
+.session-toggle {
+  padding: 11px 16px;
+  font-size: inherit;
 }
 
 .chat-section-kicker {
@@ -360,6 +406,24 @@ button:disabled {
     inset 0 1px 0 rgba(255, 255, 255, 0.76),
     inset 0 0 0 1px rgba(158, 208, 240, 0.1),
     0 18px 42px rgba(144, 177, 209, 0.16);
+  max-height: 760px;
+  overflow: hidden;
+  transition:
+    max-height 240ms ease,
+    opacity 220ms ease,
+    padding 220ms ease,
+    border-color 220ms ease,
+    margin 220ms ease;
+}
+
+.preview-panel.is-collapsed {
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  padding-top: 0;
+  padding-bottom: 0;
+  border-color: transparent;
+  box-shadow: none;
 }
 
 .preview-head {
@@ -661,6 +725,22 @@ button:disabled {
   color: #19789b;
 }
 
+.chat-message.system[data-system-kind="workspace"] {
+  background:
+    linear-gradient(135deg, rgba(236, 245, 255, 0.99), rgba(244, 248, 255, 0.95)),
+    radial-gradient(120% 120% at 0% 0%, rgba(120, 152, 255, 0.14), transparent 48%);
+  border-color: rgba(122, 152, 238, 0.32);
+  border-left-color: rgba(82, 118, 224, 0.68);
+  box-shadow:
+    0 14px 30px rgba(129, 147, 199, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.58);
+}
+
+.chat-message.system[data-system-kind="workspace"]::before {
+  content: attr(data-system-label);
+  color: #5467c7;
+}
+
 .chat-message.system[data-structured-card="true"] {
   padding: 12px 14px;
 }
@@ -739,6 +819,10 @@ button:disabled {
 
 .chat-message.system[data-system-kind="tool"] .system-card-label {
   color: #19789b;
+}
+
+.chat-message.system[data-system-kind="workspace"] .system-card-label {
+  color: #5467c7;
 }
 
 .chat-message.system[data-system-kind="retry"] .system-card-label {
@@ -996,7 +1080,8 @@ label {
   }
 
   button {
-    padding: 10px 13px;
+    padding: 8px 10px;
+    min-height: 38px;
     border-radius: 12px;
   }
 
@@ -1019,8 +1104,12 @@ label {
   }
 
   .chat-section-head {
-    align-items: flex-start;
     flex-direction: column;
+    align-items: stretch;
+  }
+
+  .conversation-tools {
+    justify-content: flex-start;
   }
 
   .session-meta {

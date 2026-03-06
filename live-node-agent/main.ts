@@ -30,6 +30,7 @@ const reconnectSessionBtn = document.querySelector("#reconnect-session-btn") as 
 const clearConversationBtn = document.querySelector(
   "#clear-conversation-btn",
 ) as HTMLButtonElement;
+const togglePreviewBtn = document.querySelector("#toggle-preview-btn") as HTMLButtonElement;
 const toggleTerminalBtn = document.querySelector("#toggle-terminal-btn") as HTMLButtonElement;
 const runBtn = document.querySelector("#run-btn") as HTMLButtonElement;
 const clearBtn = document.querySelector("#clear-btn") as HTMLButtonElement;
@@ -161,6 +162,7 @@ let workspaceTerminal: NodepodTerminal | null = null;
 let appliedConfig: AgentConfig | null = null;
 let installReady = false;
 let terminalVisible = false;
+let previewVisible = false;
 let activeTerminalKind: TerminalKind = "agent";
 let agentSessionStarted = false;
 let pendingInstallSentinelPath: string | null = null;
@@ -344,6 +346,12 @@ function setPreviewTarget(port: number, rawUrl?: string): void {
   }
 
   setStatus(`Preview ready on port ${port}.`, "success");
+}
+
+function setPreviewVisible(nextVisible: boolean): void {
+  previewVisible = nextVisible;
+  previewPanelEl.classList.toggle("is-collapsed", !previewVisible);
+  togglePreviewBtn.textContent = previewVisible ? "Hide Preview" : "Preview";
 }
 
 function writeWorkspaceTerminalLog(text: string): void {
@@ -1910,7 +1918,7 @@ function finishStartError(message: string): void {
 function setTerminalVisible(nextVisible: boolean): void {
   terminalVisible = nextVisible;
   terminalPanelEl.classList.toggle("is-collapsed", !terminalVisible);
-  toggleTerminalBtn.textContent = terminalVisible ? "Hide Terminal" : "Show Terminal";
+  toggleTerminalBtn.textContent = terminalVisible ? "Hide Terminal" : "Terminal";
   if (terminalVisible) {
     setTimeout(() => {
       fitActiveTerminal();
@@ -2274,10 +2282,11 @@ function sendAgentPromptFromInput(): void {
   cmdInput.value = "";
 }
 
-appendChatMessage("system", "LiveNode Agent ready flow: 1) Install Agent  2) Configure Env  3) Start CLI");
+appendChatMessage("system", "Setup: Install -> Env -> Start");
 appendChatMessage("system", "Use this chat box as the main interaction pane.");
 setStatus("Idle", "idle");
 setPreviewIdle();
+setPreviewVisible(false);
 updateTerminalTabState();
 renderSessionMeta();
 updateStartButtonState();
@@ -2324,6 +2333,10 @@ workspaceTerminalTabBtn.addEventListener("click", () => {
 
 toggleTerminalBtn.addEventListener("click", () => {
   setTerminalVisible(!terminalVisible);
+});
+
+togglePreviewBtn.addEventListener("click", () => {
+  setPreviewVisible(!previewVisible);
 });
 
 applyEnvBtn.addEventListener("click", () => {

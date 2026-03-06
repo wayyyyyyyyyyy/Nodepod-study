@@ -28,21 +28,71 @@
           <p class="sub">Install once, configure runtime env, then chat with agent directly.</p>
 
           <div class="row actions-row">
-            <button id="install-btn">1) Install Agent</button>
-            <button id="apply-env-btn" disabled>2) Configure Env</button>
-            <button id="start-agent-btn" disabled>3) Start CLI</button>
-            <button id="new-session-btn" disabled>New Session</button>
-            <button id="stop-session-btn" disabled>Stop Session</button>
-            <button id="reconnect-session-btn" disabled>Reconnect</button>
-            <button id="clear-conversation-btn" disabled>Clear Conversation</button>
-            <button id="toggle-terminal-btn" disabled>Show Terminal</button>
+            <button id="install-btn">Install</button>
+            <button id="apply-env-btn" disabled>Env</button>
+            <button id="start-agent-btn" disabled>Start</button>
+            <button id="toggle-preview-btn" type="button">Preview</button>
+            <button id="toggle-terminal-btn" type="button" disabled>Terminal</button>
           </div>
           <div class="status-bar">
 	            <span id="status" class="status">Idle</span>
 	            <span id="session-meta" class="session-meta">Session info will appear here.</span>
 	          </div>
 
-          <section id="preview-panel" class="preview-panel" data-state="idle">
+	          <div class="chat-section-head">
+	            <span class="chat-section-kicker">Conversation</span>
+              <div class="conversation-tools">
+                <button
+                  id="new-session-btn"
+                  type="button"
+                  class="panel-toggle session-toggle"
+                  title="Start a fresh chat session"
+                  disabled
+                >
+                  New Chat
+                </button>
+                <button
+                  id="stop-session-btn"
+                  type="button"
+                  class="panel-toggle session-toggle"
+                  title="Stop the current agent session"
+                  disabled
+                >
+                  Stop Agent
+                </button>
+                <button
+                  id="reconnect-session-btn"
+                  type="button"
+                  class="panel-toggle session-toggle"
+                  title="Resume the last agent session"
+                  disabled
+                >
+                  Resume
+                </button>
+                <button
+                  id="clear-conversation-btn"
+                  type="button"
+                  class="panel-toggle session-toggle"
+                  title="Clear the current chat view"
+                  disabled
+                >
+                  Clear View
+                </button>
+              </div>
+	          </div>
+	          <section id="chat-log" class="chat-log" aria-live="polite"></section>
+
+          <div class="row chat-input-row">
+            <input
+              id="cmd-input"
+              class="cmd-input"
+              placeholder="Type message to agent..."
+              autocomplete="off"
+            />
+            <button id="run-btn" disabled>Send</button>
+          </div>
+
+          <section id="preview-panel" class="preview-panel is-collapsed" data-state="idle">
             <div class="preview-head">
               <div class="preview-copy">
                 <span class="preview-kicker">App Preview</span>
@@ -65,21 +115,6 @@
               ></iframe>
             </div>
           </section>
-
-	          <div class="chat-section-head">
-	            <span class="chat-section-kicker">Conversation</span>
-	          </div>
-	          <section id="chat-log" class="chat-log" aria-live="polite"></section>
-
-          <div class="row chat-input-row">
-            <input
-              id="cmd-input"
-              class="cmd-input"
-              placeholder="Type message to agent..."
-              autocomplete="off"
-            />
-            <button id="run-btn" disabled>Send</button>
-          </div>
 
           <section id="terminal-panel" class="terminal-panel is-collapsed">
             <div class="terminal-toolbar">
