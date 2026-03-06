@@ -67,10 +67,13 @@ npm run dev:demo
 The current LiveNode Agent implementation is no longer tied to parsing terminal TUI output. It now uses the Pi coding agent in **RPC mode** for the main chat flow.
 
 - **Structured RPC chat** — agent replies, tool activity, retries, and errors are handled as structured events instead of raw terminal text
+- **Managed workspace bridge** — the agent can issue `workspace_run`, `workspace_status`, and `workspace_stop` directives for long-running jobs, and the result is routed back into the next agent reply
+- **Reply filtering** — the chat view now prefers the final assistant-visible reply instead of dumping intermediate streaming deltas or repeated internal attempts
 - **Dual terminals**
   - `Agent Terminal` is reserved for install logs and agent RPC debug output
   - `Workspace Terminal` is for manual commands like `vite`, `npm`, and `git`
 - **App Preview panel** — local servers started inside Nodepod can be previewed in-page
+- **Workspace job diagnostics** — failed managed jobs include command, cwd, exit code, and recent stdout/stderr tails so command failures are easier to distinguish from runtime failures
 - **Session controls**
   - `New Session`
   - `Stop Session`
@@ -93,10 +96,19 @@ For development inside the browser runtime:
 2. Run commands like `npm`, `vite`, or `git`
 3. Use the preview panel for local dev servers
 
+For long-running commands through the agent:
+
+1. Ask the agent to start or inspect a dev server
+2. Let the agent emit a `workspace_*` directive when appropriate
+3. Watch the Workspace Job card, Workspace Terminal, and preview panel for the managed job state
+4. Read the next agent reply after the workspace result is fed back into the conversation
+
 ### Notes and Known Limits
 
 - `Reconnect` depends on the installed `@mariozechner/pi-coding-agent` version supporting reopening a session from the returned `sessionFile`
 - `Clear Conversation` only clears the browser chat view; it does **not** erase the actual Pi session history
+- Only one managed workspace job is supported at a time
+- Workspace job cards expose the current managed job state, but the UI does not yet show a dedicated `queued / accepted / processed` follow-up timeline
 - The current fork is verified for **local development usage**; production deployment details are intentionally not covered here
 
 ## Quick Start

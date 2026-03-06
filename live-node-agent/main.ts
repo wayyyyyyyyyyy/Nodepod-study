@@ -1,4 +1,20 @@
 import { Nodepod, NodepodProcess, NodepodTerminal } from "../src/index";
+import {
+  buildWorkspaceJobDiagnostics,
+  buildWorkspaceDirectiveFollowUp,
+  extractWorkspaceDirective,
+  isWorkspaceJobActive,
+  summarizeWorkspaceJob,
+  type WorkspaceDirective,
+  type WorkspaceJobSnapshot,
+  type WorkspaceJobStatus,
+  WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN,
+} from "../src/live-node-agent/workspace-tools";
+import {
+  chooseWorkspaceContinuationCommand,
+  extractAssistantText,
+  extractLatestAssistantText,
+} from "../src/live-node-agent/rpc-messages";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -48,6 +64,7 @@ const modelIdInput = document.querySelector("#model-id-input") as HTMLInputEleme
 const DEFAULT_BASE_URL = "https://api.moonshot.cn/v1";
 const DEFAULT_MODEL_ID = "kimi-k2-turbo-preview";
 const PI_AGENT_HOME = "/home/user/.pi/agent";
+const PI_AGENT_APPEND_SYSTEM_PATH = "/workspace/.pi/APPEND_SYSTEM.md";
 const PI_AGENT_CLI_PATH =
   "/home/user/.pi/agent/node_modules/@mariozechner/pi-coding-agent/dist/cli.js";
 const MAX_TREE_DEPTH = 4;
@@ -56,6 +73,8 @@ const SKIP_RECURSE_DIRS = new Set(["node_modules", ".git"]);
 const FILE_TREE_AUTO_REFRESH_MS = 12000;
 const AGENT_STREAM_BUFFER_LIMIT = 120000;
 const AGENT_RPC_START_TIMEOUT_MS = 12000;
+const WORKSPACE_JOB_OUTPUT_LIMIT = 2400;
+const MAX_WORKSPACE_DIRECTIVE_CHAIN_DEPTH = 2;
 
 type AgentConfig = {
   apiKey: string;
@@ -91,7 +110,7 @@ type PreviewTarget = {
 };
 
 type TerminalKind = "agent" | "workspace";
-type SystemMessageKind = "tool" | "retry" | "error";
+type SystemMessageKind = "tool" | "retry" | "error" | "workspace";
 type SystemErrorKind = "auth" | "startup" | "rpc" | "tool" | "extension" | "runtime";
 type StructuredSystemCard = {
   label: string;
@@ -102,7 +121,7 @@ type StructuredSystemCard = {
 
 type AgentRpcRequest =
   | { id: string; type: "get_state" | "new_session" }
-  | { id: string; type: "prompt"; message: string }
+  | { id: string; type: "prompt" | "follow_up"; message: string }
   | { id: string; type: "extension_ui_response"; cancelled: true }
   | { id: string; type: "extension_ui_response"; confirmed: boolean }
   | { id: string; type: "extension_ui_response"; value: string };
@@ -121,10 +140,16 @@ type AgentRpcResponse = {
 type AgentRpcEvent =
   | { type: "agent_start" }
   | { type: "agent_end"; messages?: any[] }
+  | { type: "turn_start" }
+  | { type: "turn_end"; message?: any; toolResults?: any[] }
+  | { type: "message_start"; message?: any }
+  | { type: "message_end"; message?: any }
   | { type: "message_update"; message?: any; assistantMessageEvent?: any }
   | { type: "tool_execution_start"; toolName?: string; args?: Record<string, unknown> }
   | { type: "tool_execution_update"; toolName?: string; partialResult?: any }
   | { type: "tool_execution_end"; toolName?: string; result?: any; isError?: boolean }
+  | { type: "auto_compaction_start"; reason?: string }
+  | { type: "auto_compaction_end"; result?: any; aborted?: boolean; willRetry?: boolean; errorMessage?: string }
   | { type: "auto_retry_start"; attempt?: number; maxAttempts?: number; delayMs?: number; errorMessage?: string }
   | { type: "auto_retry_end"; success?: boolean; attempt?: number; finalError?: string }
   | { type: "extension_ui_request"; id: string; method: string; [key: string]: unknown }
@@ -159,12 +184,21 @@ let agentRpcRequestSeq = 0;
 let agentRpcStartRequestId: string | null = null;
 let agentRpcNewSessionRequestId: string | null = null;
 let agentRpcCurrentPromptId: string | null = null;
-let agentRpcReplyBuffer = "";
+let agentRpcCurrentPromptMode: "user" | "workspace-tool" | null = null;
+let agentRpcCurrentMessageText = "";
+let agentRpcLastAssistantMessageText = "";
 let lastKnownSessionFile: string | null = null;
 let activeToolMessageEl: HTMLDivElement | null = null;
 let activeRetryMessageEl: HTMLDivElement | null = null;
 let activeToolArgs: Record<string, unknown> | null = null;
+let pendingWorkspaceFollowUp = false;
+let workspaceDirectiveChainDepth = 0;
+let workspaceJobSeq = 0;
 const announcedPreviewPorts = new Set<number>();
+let workspaceJob: (WorkspaceJobSnapshot & {
+  process: NodepodProcess | null;
+  stopRequested: boolean;
+}) | null = null;
 const sessionMeta: SessionMeta = {
   cwd: "",
   sessionName: "",
@@ -310,6 +344,77 @@ function setPreviewTarget(port: number, rawUrl?: string): void {
   }
 
   setStatus(`Preview ready on port ${port}.`, "success");
+}
+
+function writeWorkspaceTerminalLog(text: string): void {
+  if (!text || !workspaceTerminal) return;
+  workspaceTerminal.write(text.replace(/\n/g, "\r\n"));
+}
+
+function trimWorkspaceJobOutput(value: string): string {
+  if (value.length <= WORKSPACE_JOB_OUTPUT_LIMIT) return value;
+  return value.slice(-WORKSPACE_JOB_OUTPUT_LIMIT);
+}
+
+function getWorkspaceJobSnapshot(): WorkspaceJobSnapshot | null {
+  if (!workspaceJob) return null;
+  const { id, command, cwd, status, port, exitCode, lastOutput, lastError } = workspaceJob;
+  return { id, command, cwd, status, port, exitCode, lastOutput, lastError };
+}
+
+function buildWorkspaceJobCard(
+  title: string,
+  body?: string,
+  snapshot: WorkspaceJobSnapshot | null = getWorkspaceJobSnapshot(),
+): StructuredSystemCard {
+  return {
+    label: "Workspace Job",
+    title,
+    meta: snapshot
+      ? `${snapshot.id} · ${snapshot.status} · ${snapshot.command}`
+      : "No managed workspace job is active.",
+    body,
+  };
+}
+
+function buildWorkspaceJobCardBody(summary: string, snapshot: WorkspaceJobSnapshot | null): string {
+  const diagnostics = buildWorkspaceJobDiagnostics(snapshot);
+  return diagnostics ? `${summary}\n${diagnostics}` : summary;
+}
+
+function appendWorkspaceJobCard(title: string, body?: string): HTMLDivElement {
+  const message = appendChatMessage("system", "");
+  setSystemMessageVariant(message, "workspace", "Workspace Job");
+  renderStructuredSystemCard(message, buildWorkspaceJobCard(title, body));
+  return message;
+}
+
+function updateWorkspaceJobStatus(status: WorkspaceJobStatus, extras: Partial<WorkspaceJobSnapshot> = {}): void {
+  if (!workspaceJob) return;
+  workspaceJob.status = status;
+  if ("port" in extras) workspaceJob.port = extras.port ?? null;
+  if ("exitCode" in extras) workspaceJob.exitCode = extras.exitCode ?? null;
+  if ("lastOutput" in extras && typeof extras.lastOutput === "string") {
+    workspaceJob.lastOutput = trimWorkspaceJobOutput(extras.lastOutput);
+  }
+  if ("lastError" in extras && typeof extras.lastError === "string") {
+    workspaceJob.lastError = trimWorkspaceJobOutput(extras.lastError);
+  }
+  renderSessionMeta();
+}
+
+function markWorkspaceJobReady(port: number): void {
+  if (!workspaceJob || !isWorkspaceJobActive(workspaceJob.status)) return;
+  workspaceJob.port = port;
+  workspaceJob.status = "ready";
+  renderSessionMeta();
+  appendWorkspaceJobCard("Workspace service ready", `Preview is available on port ${port}.`);
+}
+
+async function ensureWorkspaceToolingInstructions(): Promise<void> {
+  if (!nodepod) return;
+  await nodepod.fs.mkdir("/workspace/.pi", { recursive: true });
+  await nodepod.fs.writeFile(PI_AGENT_APPEND_SYSTEM_PATH, WORKSPACE_AGENT_APPEND_SYSTEM_MARKDOWN);
 }
 
 function sendCommand(command: string, terminalKind: TerminalKind = "agent"): void {
@@ -529,6 +634,12 @@ function renderSessionMeta(): void {
     parts.push(`pending:${sessionMeta.pendingMessageCount}`);
   }
   if (sessionMeta.cwd) parts.push(`cwd:${sessionMeta.cwd}`);
+  if (workspaceJob) {
+    parts.push(`workspace:${workspaceJob.status}`);
+    if (typeof workspaceJob.port === "number") {
+      parts.push(`port:${workspaceJob.port}`);
+    }
+  }
 
   sessionMetaEl.textContent = parts.length > 0 ? parts.join(" | ") : "Session info will appear here.";
 }
@@ -598,8 +709,11 @@ function updateSessionMetaFromState(state: any): void {
 
 function resetAgentStreamState(): void {
   awaitingAgentReply = false;
+  pendingWorkspaceFollowUp = false;
   agentRpcCurrentPromptId = null;
-  agentRpcReplyBuffer = "";
+  agentRpcCurrentPromptMode = null;
+  agentRpcCurrentMessageText = "";
+  agentRpcLastAssistantMessageText = "";
   activeToolMessageEl = null;
   activeRetryMessageEl = null;
   activeToolArgs = null;
@@ -1046,23 +1160,239 @@ function sendAgentRpcRequest(request: AgentRpcRequest): void {
   agentRpcProcess.write(`${JSON.stringify(request)}\n`);
 }
 
-function finalizeAgentReply(messages?: any[]): void {
-  const fromEvents = agentRpcReplyBuffer.trim();
-  let finalText = fromEvents;
-  if (!finalText && Array.isArray(messages)) {
-    finalText = messages
-      .filter((message) => message?.role === "assistant")
-      .flatMap((message) => (Array.isArray(message?.content) ? message.content : []))
-      .map((item) => (item?.type === "text" && typeof item.text === "string" ? item.text : ""))
-      .join("")
-      .trim();
+async function runWorkspaceJob(command: string): Promise<string> {
+  if (!nodepod) {
+    return "Workspace runtime is not ready.";
   }
 
+  const normalizedCommand = command.trim();
+  if (!normalizedCommand) {
+    return "workspace_run requires a non-empty command.";
+  }
+
+  if (workspaceJob && isWorkspaceJobActive(workspaceJob.status)) {
+    if (workspaceJob.command === normalizedCommand) {
+      appendWorkspaceJobCard("Workspace job already running", "The requested command is already active.");
+      return "The requested workspace command is already running.";
+    }
+    appendWorkspaceJobCard(
+      "Workspace job already running",
+      `Stop ${workspaceJob.id} before starting another long-running command.`,
+    );
+    return `A managed workspace job is already running: ${workspaceJob.command}.`;
+  }
+
+  const cwd = workspaceTerminal?.getCwd() || "/workspace";
+  const id = `workspace-job-${++workspaceJobSeq}`;
+  setActiveTerminal("workspace");
+
+  const proc = await nodepod.spawn(normalizedCommand, [], { cwd });
+  workspaceJob = {
+    id,
+    command: normalizedCommand,
+    cwd,
+    status: "starting",
+    process: proc,
+    stopRequested: false,
+    port: null,
+    exitCode: null,
+    lastOutput: "",
+    lastError: "",
+  };
+  renderSessionMeta();
+
+  writeWorkspaceTerminalLog(`\n[${id}] starting in ${cwd}: ${normalizedCommand}\n`);
+  appendWorkspaceJobCard("Workspace job started", `Running \`${normalizedCommand}\` in ${cwd}.`);
+
+  proc.on("output", (chunk: string) => {
+    if (!workspaceJob || workspaceJob.id !== id) return;
+    if (workspaceJob.status === "starting") {
+      updateWorkspaceJobStatus("running");
+    }
+    workspaceJob.lastOutput = trimWorkspaceJobOutput(`${workspaceJob.lastOutput || ""}${chunk}`);
+    writeWorkspaceTerminalLog(chunk);
+  });
+
+  proc.on("error", (chunk: string) => {
+    if (!workspaceJob || workspaceJob.id !== id) return;
+    workspaceJob.lastError = trimWorkspaceJobOutput(`${workspaceJob.lastError || ""}${chunk}`);
+    writeWorkspaceTerminalLog(chunk);
+  });
+
+  proc.on("exit", (code: number) => {
+    if (!workspaceJob || workspaceJob.id !== id) return;
+    workspaceJob.process = null;
+    workspaceJob.exitCode = code;
+
+    const stopped = workspaceJob.stopRequested;
+    workspaceJob.status = stopped ? "stopped" : code === 0 ? "exited" : "failed";
+    renderSessionMeta();
+
+    if (activePreview && workspaceJob.port && activePreview.port === workspaceJob.port) {
+      setPreviewIdle(
+        stopped
+          ? "Workspace job stopped. Run a local server in the terminal to open a live preview."
+          : "Workspace job exited. Run a local server in the terminal to open a live preview.",
+      );
+    }
+
+    writeWorkspaceTerminalLog(`\n[${id}] exited with code ${code}\n`);
+    const snapshot = getWorkspaceJobSnapshot();
+    const outcomeSummary = stopped
+      ? "The managed command was stopped."
+      : code === 0
+        ? "The managed command exited cleanly."
+        : "The managed command failed. Inspect the command diagnostics below.";
+    appendWorkspaceJobCard(
+      stopped ? "Workspace job stopped" : code === 0 ? "Workspace job exited" : "Workspace job failed",
+      buildWorkspaceJobCardBody(outcomeSummary, snapshot),
+    );
+  });
+
+  return `Started managed workspace job ${id}.`;
+}
+
+function getWorkspaceJobStatusNote(): string {
+  if (!workspaceJob) {
+    appendWorkspaceJobCard("Workspace job status", "No managed workspace job is active.");
+    return "No managed workspace job is active.";
+  }
+
+  const snapshot = getWorkspaceJobSnapshot();
+  const report = [summarizeWorkspaceJob(snapshot), buildWorkspaceJobDiagnostics(snapshot)]
+    .filter(Boolean)
+    .join("\n");
+  appendWorkspaceJobCard("Workspace job status", report);
+  return summarizeWorkspaceJob(snapshot);
+}
+
+function stopWorkspaceJob(): string {
+  if (!workspaceJob) {
+    appendWorkspaceJobCard("Workspace job stop", "No managed workspace job is active.");
+    return "No managed workspace job is active.";
+  }
+
+  if (!workspaceJob.process || workspaceJob.process.exited || !isWorkspaceJobActive(workspaceJob.status)) {
+    appendWorkspaceJobCard("Workspace job stop", "The managed workspace job is not currently running.");
+    return "The managed workspace job is not currently running.";
+  }
+
+  workspaceJob.stopRequested = true;
+  workspaceJob.status = "stopped";
+  renderSessionMeta();
+  workspaceJob.process.kill();
+  appendWorkspaceJobCard("Stopping workspace job", `Stopping \`${workspaceJob.command}\`.`);
+  return `Stopping managed workspace job ${workspaceJob.id}.`;
+}
+
+function queueWorkspaceDirectiveFollowUp(directive: WorkspaceDirective, note: string): void {
+  if (!agentSessionStarted) return;
+  if (!agentRpcProcess || agentRpcProcess.exited) {
+    setStatus("Agent session is not running.", "error");
+    return;
+  }
+  if (workspaceDirectiveChainDepth >= MAX_WORKSPACE_DIRECTIVE_CHAIN_DEPTH) {
+    appendErrorMessage(
+      "Workspace directive chain limit reached. Refine the request before retrying.",
+      "runtime",
+    );
+    return;
+  }
+
+  const requestType = chooseWorkspaceContinuationCommand(awaitingAgentReply);
+  const message = buildWorkspaceDirectiveFollowUp(directive, getWorkspaceJobSnapshot(), note);
+
+  if (requestType === "prompt") {
+    if (
+      queueAgentPrompt(message, {
+        mode: "workspace-tool",
+        statusText: "Workspace tool result sent to the agent.",
+      })
+    ) {
+      workspaceDirectiveChainDepth += 1;
+    }
+    return;
+  }
+
+  if (pendingWorkspaceFollowUp) return;
+
+  workspaceDirectiveChainDepth += 1;
+  pendingWorkspaceFollowUp = true;
+  agentRpcCurrentMessageText = "";
+  agentRpcLastAssistantMessageText = "";
+  agentRpcCurrentPromptId = nextAgentRpcId("follow-up");
+  agentRpcCurrentPromptMode = "workspace-tool";
+  updateChatControlsState();
+  setStatus("Workspace tool result queued for the agent.", "success");
+
+  try {
+    sendAgentRpcRequest({
+      id: agentRpcCurrentPromptId,
+      type: "follow_up",
+      message,
+    });
+  } catch (err) {
+    pendingWorkspaceFollowUp = false;
+    resetAgentStreamState();
+    const message = err instanceof Error ? err.message : String(err);
+    appendErrorMessage(message, "rpc");
+    setStatus(message, "error");
+  }
+}
+
+async function handleWorkspaceDirective(directive: WorkspaceDirective): Promise<void> {
+  let note = "";
+
+  try {
+    switch (directive.action) {
+      case "run":
+        note = await runWorkspaceJob(directive.command || "");
+        break;
+      case "status":
+        note = getWorkspaceJobStatusNote();
+        break;
+      case "stop":
+        note = stopWorkspaceJob();
+        break;
+    }
+  } catch (err) {
+    note = err instanceof Error ? err.message : String(err);
+    appendErrorMessage(`Workspace tool failed: ${note}`, "runtime");
+    setStatus(note, "error");
+    return;
+  }
+
+  queueWorkspaceDirectiveFollowUp(directive, note);
+}
+
+function finalizeAgentReply(messages?: any[]): void {
+  const promptMode = agentRpcCurrentPromptMode;
+  let finalText = extractLatestAssistantText(messages);
+  if (!finalText) {
+    finalText = agentRpcLastAssistantMessageText.trim() || agentRpcCurrentMessageText.trim();
+  }
+
+  const { cleanText, directive, hasMultiple } = extractWorkspaceDirective(finalText);
+  finalText = cleanText;
+
   resetAgentStreamState();
+
   if (finalText) {
     appendChatMessage("agent", finalText);
-  } else {
+  } else if (promptMode === "user" && !directive) {
     appendSystemStatusMessage("Agent finished without a text reply.", "retry", "Reply");
+  }
+
+  if (hasMultiple) {
+    appendErrorMessage(
+      "Assistant emitted multiple workspace directives. Only the first directive will be used.",
+      "runtime",
+    );
+  }
+
+  if (directive) {
+    void handleWorkspaceDirective(directive);
+    return;
   }
   setStatus("Agent ready.", "success");
 }
@@ -1098,21 +1428,38 @@ function respondToUnsupportedDialog(event: Extract<AgentRpcEvent, { type: "exten
 function handleAgentRpcEvent(event: AgentRpcEvent): void {
   switch (event.type) {
     case "agent_start":
+      if (pendingWorkspaceFollowUp && !awaitingAgentReply) {
+        awaitingAgentReply = true;
+        pendingWorkspaceFollowUp = false;
+        updateChatControlsState();
+      }
       if (awaitingAgentReply) {
         setStatus("Agent is thinking...", "loading");
       }
       break;
+    case "message_start":
+      if (awaitingAgentReply && event.message?.role === "assistant") {
+        agentRpcCurrentMessageText = "";
+      }
+      break;
     case "message_update":
       if (!awaitingAgentReply) break;
+      if (event.message?.role !== "assistant") break;
       if (event.assistantMessageEvent?.type === "text_delta") {
         const delta = String(event.assistantMessageEvent.delta ?? "");
         if (delta) {
-          agentRpcReplyBuffer += delta;
-          if (agentRpcReplyBuffer.length > AGENT_STREAM_BUFFER_LIMIT) {
-            agentRpcReplyBuffer = agentRpcReplyBuffer.slice(-AGENT_STREAM_BUFFER_LIMIT);
+          agentRpcCurrentMessageText += delta;
+          if (agentRpcCurrentMessageText.length > AGENT_STREAM_BUFFER_LIMIT) {
+            agentRpcCurrentMessageText = agentRpcCurrentMessageText.slice(-AGENT_STREAM_BUFFER_LIMIT);
           }
         }
       }
+      break;
+    case "message_end":
+      if (!awaitingAgentReply || event.message?.role !== "assistant") break;
+      agentRpcLastAssistantMessageText =
+        extractAssistantText(event.message) || agentRpcCurrentMessageText.trim();
+      agentRpcCurrentMessageText = "";
       break;
     case "tool_execution_start":
       if (awaitingAgentReply) {
@@ -1162,6 +1509,12 @@ function handleAgentRpcEvent(event: AgentRpcEvent): void {
       if (typeof event.error === "string") {
         appendErrorMessage(`Extension error: ${event.error}`, "extension");
       }
+      break;
+    case "turn_start":
+    case "turn_end":
+    case "auto_compaction_start":
+    case "auto_compaction_end":
+    case "tool_execution_update":
       break;
     case "agent_end":
       if (awaitingAgentReply) {
@@ -1223,6 +1576,7 @@ function handleAgentRpcResponse(response: AgentRpcResponse): void {
     }
 
     resetAgentStreamState();
+    workspaceDirectiveChainDepth = 0;
     appendChatMessage("system", "Started a new agent session.");
     setStatus("New agent session started.", "success");
     try {
@@ -1240,12 +1594,24 @@ function handleAgentRpcResponse(response: AgentRpcResponse): void {
     return;
   }
 
-  if (response.command === "prompt" || response.id === agentRpcCurrentPromptId) {
+  if (
+    response.command === "prompt" ||
+    response.command === "follow_up" ||
+    response.id === agentRpcCurrentPromptId
+  ) {
     if (!response.success) {
       const message = response.error?.message || "Agent request failed.";
       resetAgentStreamState();
       appendErrorMessage(message, "rpc");
       setStatus(message, "error");
+    } else if (response.command === "follow_up" || String(response.id).startsWith("follow-up")) {
+      if (!awaitingAgentReply) {
+        setStatus("Workspace tool result accepted. Waiting for the agent to process it...", "idle");
+      }
+    } else if (response.command === "prompt" || response.id === agentRpcCurrentPromptId) {
+      if (agentRpcCurrentPromptMode === "workspace-tool") {
+        setStatus("Workspace tool result is being processed by the agent.", "loading");
+      }
     }
   }
 }
@@ -1265,10 +1631,16 @@ function isAgentRpcPayload(value: any): value is AgentRpcResponse | AgentRpcEven
   return [
     "agent_start",
     "agent_end",
+    "turn_start",
+    "turn_end",
+    "message_start",
+    "message_end",
     "message_update",
     "tool_execution_start",
     "tool_execution_update",
     "tool_execution_end",
+    "auto_compaction_start",
+    "auto_compaction_end",
     "auto_retry_start",
     "auto_retry_end",
     "extension_ui_request",
@@ -1351,27 +1723,37 @@ function handleAgentRpcStdout(chunk: string): void {
   }
 }
 
-function queueAgentPrompt(prompt: string): void {
+function queueAgentPrompt(
+  prompt: string,
+  options: {
+    mode?: "user" | "workspace-tool";
+    statusText?: string;
+  } = {},
+): boolean {
   if (!agentRpcProcess || agentRpcProcess.exited) {
     setStatus("Agent session is not running.", "error");
-    return;
+    return false;
   }
   awaitingAgentReply = true;
-  agentRpcReplyBuffer = "";
+  agentRpcCurrentMessageText = "";
+  agentRpcLastAssistantMessageText = "";
   agentRpcCurrentPromptId = nextAgentRpcId("prompt");
+  agentRpcCurrentPromptMode = options.mode ?? "user";
   updateChatControlsState();
-  setStatus("Agent is thinking...", "loading");
+  setStatus(options.statusText || "Agent is thinking...", "loading");
   try {
     sendAgentRpcRequest({
       id: agentRpcCurrentPromptId,
       type: "prompt",
       message: prompt,
     });
+    return true;
   } catch (err) {
     resetAgentStreamState();
     const message = err instanceof Error ? err.message : String(err);
     appendErrorMessage(message, "rpc");
     setStatus(message, "error");
+    return false;
   }
 }
 
@@ -1380,6 +1762,7 @@ async function startAgentRpcSession(
   sessionFile: string | null = null,
 ): Promise<void> {
   if (!nodepod) throw new Error("Nodepod runtime is not ready.");
+  await ensureWorkspaceToolingInstructions();
 
   stopAgentRpcProcess(false);
   pendingStart = true;
@@ -1504,6 +1887,7 @@ function clearStartWatchdog(): void {
 function finishStartSuccess(): void {
   pendingStart = false;
   pendingReconnect = false;
+  workspaceDirectiveChainDepth = 0;
   clearStartWatchdog();
   updateStartButtonState();
   agentSessionStarted = true;
@@ -1821,6 +2205,7 @@ async function bootRuntime(): Promise<void> {
         swUrl: "/__sw__.js",
         onServerReady: (port, url) => {
           setPreviewTarget(port, url);
+          markWorkspaceJobReady(port);
         },
       });
       setPreviewIdle("Run a local server in the terminal to open a live preview.");
@@ -1851,6 +2236,7 @@ async function bootRuntime(): Promise<void> {
     workspaceTerminal.showPrompt();
 
     setActiveTerminal("agent");
+    await ensureWorkspaceToolingInstructions();
 
     applyEnvBtn.disabled = false;
     updateStartButtonState();
@@ -1883,7 +2269,8 @@ function sendAgentPromptFromInput(): void {
   }
 
   appendChatMessage("user", prompt);
-  queueAgentPrompt(prompt);
+  workspaceDirectiveChainDepth = 0;
+  queueAgentPrompt(prompt, { mode: "user", statusText: "Agent is thinking..." });
   cmdInput.value = "";
 }
 
