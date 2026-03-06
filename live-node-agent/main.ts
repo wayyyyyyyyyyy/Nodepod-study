@@ -11,6 +11,10 @@ const startAgentBtn = document.querySelector("#start-agent-btn") as HTMLButtonEl
 const toggleTerminalBtn = document.querySelector("#toggle-terminal-btn") as HTMLButtonElement;
 const runBtn = document.querySelector("#run-btn") as HTMLButtonElement;
 const clearBtn = document.querySelector("#clear-btn") as HTMLButtonElement;
+const agentTerminalTabBtn = document.querySelector("#agent-terminal-tab") as HTMLButtonElement;
+const workspaceTerminalTabBtn = document.querySelector(
+  "#workspace-terminal-tab",
+) as HTMLButtonElement;
 const uploadFileBtn = document.querySelector("#upload-file-btn") as HTMLButtonElement;
 const downloadFileBtn = document.querySelector("#download-file-btn") as HTMLButtonElement;
 const fileSelectionEl = document.querySelector("#file-selection") as HTMLDivElement;
@@ -18,7 +22,15 @@ const fileUploadInput = document.querySelector("#file-upload-input") as HTMLInpu
 const cmdInput = document.querySelector("#cmd-input") as HTMLInputElement;
 const chatLogEl = document.querySelector("#chat-log") as HTMLDivElement;
 const terminalPanelEl = document.querySelector("#terminal-panel") as HTMLElement;
+const terminalHintEl = document.querySelector("#terminal-hint") as HTMLSpanElement;
 const fileTreeEl = document.querySelector("#file-tree") as HTMLDivElement;
+const agentTerminalEl = document.querySelector("#agent-terminal") as HTMLDivElement;
+const workspaceTerminalEl = document.querySelector("#workspace-terminal") as HTMLDivElement;
+const previewPanelEl = document.querySelector("#preview-panel") as HTMLElement;
+const previewMetaEl = document.querySelector("#preview-meta") as HTMLSpanElement;
+const previewPlaceholderEl = document.querySelector("#preview-placeholder") as HTMLDivElement;
+const previewFrameEl = document.querySelector("#preview-frame") as HTMLIFrameElement;
+const openPreviewBtn = document.querySelector("#open-preview-btn") as HTMLButtonElement;
 
 const envDialog = document.querySelector("#env-dialog") as HTMLDialogElement;
 const envForm = document.querySelector("#env-form") as HTMLFormElement;
@@ -92,11 +104,22 @@ type SessionMeta = {
   model: string;
 };
 
+type PreviewState = "idle" | "ready" | "unavailable";
+
+type PreviewTarget = {
+  port: number;
+  url: string;
+};
+
+type TerminalKind = "agent" | "workspace";
+
 let nodepod: Nodepod | null = null;
-let terminal: NodepodTerminal | null = null;
+let agentTerminal: NodepodTerminal | null = null;
+let workspaceTerminal: NodepodTerminal | null = null;
 let appliedConfig: AgentConfig | null = null;
 let installReady = false;
 let terminalVisible = false;
+let activeTerminalKind: TerminalKind = "agent";
 let agentSessionStarted = false;
 let pendingInstallSentinelPath: string | null = null;
 let installPollTimer: number | null = null;
@@ -115,6 +138,10 @@ let selectedTreePath: string | null = null;
 let selectedTreeIsDirectory = false;
 let fileTreeRefreshInFlight = false;
 let fileTreeAutoRefreshTimer: number | null = null;
+let previewState: PreviewState = "idle";
+let previewMessage = "Run a local server in the terminal to open a live preview.";
+let activePreview: PreviewTarget | null = null;
+const announcedPreviewPorts = new Set<number>();
 const sessionMeta: SessionMeta = {
   cwd: "",
   usage: "",
@@ -143,7 +170,109 @@ function setStatus(text: string, state: StatusState = "idle"): void {
   statusEl.dataset.state = state;
 }
 
-function sendCommand(command: string): void {
+function getTerminal(kind: TerminalKind): NodepodTerminal | null {
+  return kind === "agent" ? agentTerminal : workspaceTerminal;
+}
+
+function getActiveTerminal(): NodepodTerminal | null {
+  return getTerminal(activeTerminalKind);
+}
+
+function updateTerminalTabState(): void {
+  agentTerminalTabBtn.classList.toggle("is-active", activeTerminalKind === "agent");
+  workspaceTerminalTabBtn.classList.toggle("is-active", activeTerminalKind === "workspace");
+  agentTerminalEl.classList.toggle("is-hidden", activeTerminalKind !== "agent");
+  workspaceTerminalEl.classList.toggle("is-hidden", activeTerminalKind !== "workspace");
+
+  terminalHintEl.textContent =
+    activeTerminalKind === "agent"
+      ? "Agent Terminal is reserved for install logs and the running CLI."
+      : "Workspace Terminal is for manual commands like vite, npm, and git.";
+}
+
+function fitActiveTerminal(): void {
+  getActiveTerminal()?.fit();
+}
+
+function setActiveTerminal(kind: TerminalKind): void {
+  activeTerminalKind = kind;
+  updateTerminalTabState();
+  if (terminalVisible) {
+    setTimeout(() => {
+      fitActiveTerminal();
+    }, 60);
+  }
+}
+
+function buildPreviewUrl(port: number, rawUrl?: string): string {
+  if (rawUrl) {
+    try {
+      const parsed = new URL(rawUrl, location.origin);
+      parsed.pathname = `/__preview__/${port}/`;
+      parsed.search = "";
+      parsed.hash = "";
+      return parsed.toString();
+    } catch {
+      /* ignore and fall back */
+    }
+  }
+
+  return new URL(`/__preview__/${port}/`, location.origin).toString();
+}
+
+function renderPreviewState(): void {
+  previewPanelEl.dataset.state = previewState;
+  previewMetaEl.textContent = activePreview
+    ? `Port ${activePreview.port} is ready inside the browser runtime.`
+    : previewMessage;
+  previewPlaceholderEl.textContent = previewMessage;
+  openPreviewBtn.disabled = !activePreview;
+
+  if (activePreview) {
+    previewFrameEl.hidden = false;
+    if (previewFrameEl.src !== activePreview.url) {
+      previewFrameEl.src = activePreview.url;
+    }
+    return;
+  }
+
+  previewFrameEl.hidden = true;
+  previewFrameEl.removeAttribute("src");
+}
+
+function setPreviewIdle(message = "Run a local server in the terminal to open a live preview."): void {
+  previewState = "idle";
+  previewMessage = message;
+  activePreview = null;
+  renderPreviewState();
+}
+
+function setPreviewUnavailable(message: string): void {
+  previewState = "unavailable";
+  previewMessage = message;
+  activePreview = null;
+  renderPreviewState();
+}
+
+function setPreviewTarget(port: number, rawUrl?: string): void {
+  activePreview = {
+    port,
+    url: buildPreviewUrl(port, rawUrl),
+  };
+  previewState = "ready";
+  previewMessage = `Port ${port} is ready inside the browser runtime.`;
+  renderPreviewState();
+
+  if (!announcedPreviewPorts.has(port)) {
+    announcedPreviewPorts.add(port);
+    appendChatMessage("system", `Preview ready on port ${port}.`);
+  }
+
+  setStatus(`Preview ready on port ${port}.`, "success");
+}
+
+function sendCommand(command: string, terminalKind: TerminalKind = "agent"): void {
+  const terminal = getTerminal(terminalKind);
   if (!terminal) return;
   const trimmed = command.trim();
   if (!trimmed) return;
@@ -440,8 +569,8 @@ function extractFinalAgentText(
   return { text, nextCursor: transcript.length };
 }
 
-function readVisibleTerminalText(): string {
-  const xterm = terminal?.xterm as any;
+function readAgentTerminalText(): string {
+  const xterm = agentTerminal?.xterm as any;
   const active = xterm?.buffer?.active;
   if (!xterm || !active) return "";
 
@@ -493,7 +622,7 @@ function extractFinalAgentTextFromScreen(screenText: string, prompt: string): st
 function settleAgentReply(): void {
   if (!awaitingAgentReply) return;
 
-  const screenText = readVisibleTerminalText();
+  const screenText = readAgentTerminalText();
   if (terminalReplyStillWorking(screenText) && Date.now() - agentReplyStartedAt < 30000) {
     clearAgentSettleTimer();
     agentSettleTimer = window.setTimeout(() => {
@@ -710,7 +839,7 @@ function setTerminalVisible(nextVisible: boolean): void {
   toggleTerminalBtn.textContent = terminalVisible ? "Hide Terminal" : "Show Terminal";
   if (terminalVisible) {
     setTimeout(() => {
-      terminal?.fit();
+      fitActiveTerminal();
     }, 60);
   }
 }
@@ -978,14 +1107,14 @@ async function bootRuntime(): Promise<void> {
   if (nodepod) return;
 
   setStatus("Booting Nodepod runtime...", "loading");
+  setPreviewIdle("Booting preview bridge...");
   installBtn.disabled = true;
   installReady = false;
   updateStartButtonState();
 
   try {
     const corsProxyUrl = new URL("/__cors_proxy__/", location.origin).toString();
-
-    nodepod = await Nodepod.boot({
+    const bootOptions = {
       workdir: "/workspace",
       env: {
         HOME: "/home/user",
@@ -1002,17 +1131,44 @@ async function bootRuntime(): Promise<void> {
           2,
         ),
       },
-    });
+    } as const;
 
-    terminal = nodepod.createTerminal({ Terminal, FitAddon });
-    terminal.attach("#terminal");
-    wireTerminalOutputMirror(terminal);
-    terminal.showPrompt();
+    try {
+      nodepod = await Nodepod.boot({
+        ...bootOptions,
+        swUrl: "/__sw__.js",
+        onServerReady: (port, url) => {
+          setPreviewTarget(port, url);
+        },
+      });
+      setPreviewIdle("Run a local server in the terminal to open a live preview.");
+    } catch (previewErr) {
+      const message = previewErr instanceof Error ? previewErr.message : String(previewErr);
+      nodepod = await Nodepod.boot(bootOptions);
+      setPreviewUnavailable(`Preview unavailable in this session. ${message}`);
+      appendChatMessage(
+        "system",
+        "Preview bridge unavailable. Runtime booted without in-page app preview.",
+      );
+    }
+
+    agentTerminal = nodepod.createTerminal({ Terminal, FitAddon });
+    agentTerminal.attach(agentTerminalEl);
+    wireTerminalOutputMirror(agentTerminal);
+    agentTerminal.showPrompt();
+
+    workspaceTerminal = nodepod.createTerminal({ Terminal, FitAddon });
+    workspaceTerminal.attach(workspaceTerminalEl);
+    workspaceTerminal.showPrompt();
+
+    setActiveTerminal("agent");
 
     applyEnvBtn.disabled = false;
     updateStartButtonState();
     toggleTerminalBtn.disabled = false;
     clearBtn.disabled = false;
+    agentTerminalTabBtn.disabled = false;
+    workspaceTerminalTabBtn.disabled = false;
     uploadFileBtn.disabled = false;
     updateChatControlsState();
     updateFileActionState();
@@ -1023,6 +1179,7 @@ async function bootRuntime(): Promise<void> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     setStatus(`Boot failed: ${message}`, "error");
+    setPreviewUnavailable(`Preview unavailable because runtime boot failed. ${message}`);
     installBtn.disabled = false;
   }
 }
@@ -1045,6 +1202,8 @@ function sendAgentPromptFromInput(): void {
 appendChatMessage("system", "LiveNode Agent ready flow: 1) Install Agent  2) Configure Env  3) Start CLI");
 appendChatMessage("system", "Use this chat box as the main interaction pane.");
 setStatus("Idle", "idle");
+setPreviewIdle();
+updateTerminalTabState();
 renderSessionMeta();
 updateStartButtonState();
 updateChatControlsState();
@@ -1073,6 +1232,19 @@ fileUploadInput.addEventListener("change", () => {
 
 downloadFileBtn.addEventListener("click", () => {
   void downloadSelectedFile();
+});
+
+openPreviewBtn.addEventListener("click", () => {
+  if (!activePreview) return;
+  window.open(activePreview.url, "_blank", "noopener,noreferrer");
+});
+
+agentTerminalTabBtn.addEventListener("click", () => {
+  setActiveTerminal("agent");
+});
+
+workspaceTerminalTabBtn.addEventListener("click", () => {
+  setActiveTerminal("workspace");
 });
 
 toggleTerminalBtn.addEventListener("click", () => {
@@ -1129,6 +1301,7 @@ installBtn.addEventListener("click", async () => {
   setStatus("Installing pi-coding-agent...", "loading");
   installReady = false;
   updateStartButtonState();
+  setActiveTerminal("agent");
 
   if (!nodepod) {
     await bootRuntime();
@@ -1182,6 +1355,7 @@ startAgentBtn.addEventListener("click", () => {
   pendingStart = true;
   resetAgentStreamState();
   updateStartButtonState();
+  setActiveTerminal("agent");
   pendingStartBuffer = "";
   clearStartWatchdog();
   startWatchdogTimer = window.setTimeout(() => {
@@ -1205,6 +1379,10 @@ cmdInput.addEventListener("keydown", (event) => {
 });
 
 clearBtn.addEventListener("click", () => {
-  terminal?.clear();
-  terminal?.showPrompt();
+  const terminal = getActiveTerminal();
+  if (!terminal) return;
+  terminal.clear();
+  if (!(terminal as any)._running) {
+    terminal.showPrompt();
+  }
 });

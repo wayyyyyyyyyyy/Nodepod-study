@@ -33,10 +33,34 @@
             <button id="start-agent-btn" disabled>3) Start CLI</button>
             <button id="toggle-terminal-btn" disabled>Show Terminal</button>
           </div>
-	          <div class="status-bar">
+          <div class="status-bar">
 	            <span id="status" class="status">Idle</span>
 	            <span id="session-meta" class="session-meta">Session info will appear here.</span>
 	          </div>
+
+          <section id="preview-panel" class="preview-panel" data-state="idle">
+            <div class="preview-head">
+              <div class="preview-copy">
+                <span class="preview-kicker">App Preview</span>
+                <span id="preview-meta" class="preview-meta"
+                  >Run a local server in the terminal to open a live preview.</span
+                >
+              </div>
+              <button id="open-preview-btn" type="button" disabled>Open Preview</button>
+            </div>
+            <div class="preview-shell">
+              <div id="preview-placeholder" class="preview-placeholder">
+                Start a local server inside the browser terminal. When a port becomes ready, it
+                will open here automatically.
+              </div>
+              <iframe
+                id="preview-frame"
+                class="preview-frame"
+                title="Live app preview"
+                hidden
+              ></iframe>
+            </div>
+          </section>
 
 	          <div class="chat-section-head">
 	            <span class="chat-section-kicker">Conversation</span>
@@ -54,11 +78,29 @@
           </div>
 
           <section id="terminal-panel" class="terminal-panel is-collapsed">
-            <div class="row">
-              <button id="clear-btn" disabled>Clear Terminal</button>
-              <span class="hint">Terminal is optional and can stay collapsed.</span>
+            <div class="terminal-toolbar">
+              <div class="row terminal-tabs">
+                <button id="agent-terminal-tab" type="button" class="terminal-tab" disabled>
+                  Agent Terminal
+                </button>
+                <button
+                  id="workspace-terminal-tab"
+                  type="button"
+                  class="terminal-tab"
+                  disabled
+                >
+                  Workspace Terminal
+                </button>
+              </div>
+              <div class="row terminal-actions">
+                <button id="clear-btn" disabled>Clear Terminal</button>
+                <span id="terminal-hint" class="hint">Terminal is optional and can stay collapsed.</span>
+              </div>
             </div>
-            <div id="terminal" class="terminal"></div>
+            <div class="terminal-stack">
+              <div id="agent-terminal" class="terminal-shell"></div>
+              <div id="workspace-terminal" class="terminal-shell is-hidden"></div>
+            </div>
           </section>
         </section>
       </section>

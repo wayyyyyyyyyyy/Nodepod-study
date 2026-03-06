@@ -2,6 +2,8 @@ import { defineConfig } from "vite";
 import topLevelAwait from "vite-plugin-top-level-await";
 import wasm from "vite-plugin-wasm";
 import { build as esbuild } from "esbuild";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 function inlineProcessWorkerPlugin() {
   const VIRTUAL_ID = "virtual:process-worker-bundle";
@@ -146,8 +148,42 @@ function corsRelayPlugin() {
   };
 }
 
+function serviceWorkerAliasPlugin() {
+  const swSource = resolve(process.cwd(), "static/__sw__.js");
+  const handler = (req: any, res: any, next: () => void) => {
+    const rawUrl = req.url as string | undefined;
+    const pathname = rawUrl ? rawUrl.split("?")[0] : "";
+    if (pathname !== "/__sw__.js") {
+      next();
+      return;
+    }
+
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Service-Worker-Allowed", "/");
+    res.end(readFileSync(swSource, "utf8"));
+  };
+
+  return {
+    name: "demo-service-worker-alias",
+    configureServer(server: any) {
+      server.middlewares.use(handler);
+    },
+    configurePreviewServer(server: any) {
+      server.middlewares.use(handler);
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [wasm(), topLevelAwait(), inlineProcessWorkerPlugin(), corsRelayPlugin()],
+  plugins: [
+    wasm(),
+    topLevelAwait(),
+    inlineProcessWorkerPlugin(),
+    corsRelayPlugin(),
+    serviceWorkerAliasPlugin(),
+  ],
   server: {
     host: "127.0.0.1",
     port: 5174,
