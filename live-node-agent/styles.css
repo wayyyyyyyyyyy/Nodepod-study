@@ -329,9 +329,9 @@ button:disabled {
   color: rgba(95, 118, 145, 0.94);
   font-size: 12px;
   line-height: 1.4;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  overflow: hidden;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: right;
 }
 
 .preview-panel {
@@ -633,6 +633,38 @@ button:disabled {
   color: #39789d;
 }
 
+.chat-message.system[data-system-kind="tool"] {
+  background:
+    linear-gradient(135deg, rgba(229, 247, 255, 0.99), rgba(238, 248, 255, 0.95)),
+    radial-gradient(120% 120% at 0% 0%, rgba(96, 204, 255, 0.16), transparent 48%);
+  border-color: rgba(88, 191, 241, 0.34);
+  border-left-color: rgba(24, 166, 212, 0.7);
+  box-shadow:
+    0 14px 30px rgba(118, 163, 201, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.58);
+}
+
+.chat-message.system[data-system-kind="tool"]::before {
+  content: attr(data-system-label);
+  color: #19789b;
+}
+
+.chat-message.system[data-system-kind="retry"] {
+  background:
+    linear-gradient(135deg, rgba(255, 246, 231, 0.99), rgba(255, 250, 241, 0.96)),
+    radial-gradient(120% 120% at 0% 0%, rgba(255, 189, 94, 0.18), transparent 46%);
+  border-color: rgba(238, 179, 94, 0.3);
+  border-left-color: rgba(224, 147, 36, 0.62);
+  box-shadow:
+    0 14px 30px rgba(189, 157, 106, 0.14),
+    inset 0 1px 0 rgba(255, 255, 255, 0.54);
+}
+
+.chat-message.system[data-system-kind="retry"]::before {
+  content: attr(data-system-label);
+  color: #a26812;
+}
+
 .chat-input-row {
   gap: 8px;
 }
@@ -902,6 +934,7 @@ label {
     margin-left: 0;
     max-width: 100%;
     width: 100%;
+    text-align: left;
   }
 
   .chat-log {

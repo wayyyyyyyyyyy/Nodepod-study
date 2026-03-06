@@ -71,8 +71,11 @@ type StatusState = "idle" | "loading" | "success" | "error";
 
 type SessionMeta = {
   cwd: string;
-  usage: string;
+  sessionName: string;
+  sessionId: string;
   model: string;
+  messageCount: number | null;
+  pendingMessageCount: number | null;
 };
 
 type PreviewState = "idle" | "ready" | "unavailable";
@@ -83,6 +86,7 @@ type PreviewTarget = {
 };
 
 type TerminalKind = "agent" | "workspace";
+type SystemMessageKind = "tool" | "retry";
 
 type AgentRpcRequest =
   | { id: string; type: "get_state" | "new_session" }
@@ -145,11 +149,15 @@ let agentRpcCurrentPromptId: string | null = null;
 let agentRpcReplyBuffer = "";
 let activeToolMessageEl: HTMLDivElement | null = null;
 let activeRetryMessageEl: HTMLDivElement | null = null;
+let activeToolArgs: Record<string, unknown> | null = null;
 const announcedPreviewPorts = new Set<number>();
 const sessionMeta: SessionMeta = {
   cwd: "",
-  usage: "",
+  sessionName: "",
+  sessionId: "",
   model: "",
+  messageCount: null,
+  pendingMessageCount: null,
 };
 
 function updateChatControlsState(): void {
@@ -157,6 +165,7 @@ function updateChatControlsState(): void {
   cmdInput.disabled = !canChat;
   runBtn.disabled = !canChat || awaitingAgentReply;
   newSessionBtn.disabled = !canChat || awaitingAgentReply || pendingStart;
+  renderSessionMeta();
 }
 
 function updateFileActionState(): void {
@@ -317,6 +326,25 @@ function updateChatMessage(message: HTMLDivElement, text: string): void {
   scrollChatToBottom();
 }
 
+function setSystemMessageVariant(
+  message: HTMLDivElement,
+  kind: SystemMessageKind,
+  label: string,
+): void {
+  message.dataset.systemKind = kind;
+  message.dataset.systemLabel = label;
+}
+
+function appendSystemStatusMessage(
+  text: string,
+  kind: SystemMessageKind,
+  label: string,
+): HTMLDivElement {
+  const message = appendChatMessage("system", text);
+  setSystemMessageVariant(message, kind, label);
+  return message;
+}
+
 function sanitizeUploadName(name: string): string {
   return name.replace(/[\\/]+/g, "-").trim() || "upload.bin";
 }
@@ -359,9 +387,28 @@ function startFileTreeAutoRefresh(): void {
 function renderSessionMeta(): void {
   if (!sessionMetaEl) return;
   const parts: string[] = [];
-  if (sessionMeta.cwd) parts.push(sessionMeta.cwd);
-  if (sessionMeta.usage) parts.push(sessionMeta.usage);
-  if (sessionMeta.model) parts.push(sessionMeta.model);
+
+  if (pendingStart) {
+    parts.push("rpc:starting");
+  } else if (pendingSessionReset) {
+    parts.push("rpc:resetting");
+  } else if (!agentSessionStarted) {
+    parts.push("rpc:offline");
+  } else if (awaitingAgentReply) {
+    parts.push("rpc:busy");
+  } else {
+    parts.push("rpc:ready");
+  }
+
+  if (sessionMeta.model) parts.push(`model:${sessionMeta.model}`);
+  if (sessionMeta.sessionName) parts.push(`name:${sessionMeta.sessionName}`);
+  if (sessionMeta.sessionId) parts.push(`id:${sessionMeta.sessionId.slice(0, 8)}`);
+  if (typeof sessionMeta.messageCount === "number") parts.push(`msgs:${sessionMeta.messageCount}`);
+  if (typeof sessionMeta.pendingMessageCount === "number") {
+    parts.push(`pending:${sessionMeta.pendingMessageCount}`);
+  }
+  if (sessionMeta.cwd) parts.push(`cwd:${sessionMeta.cwd}`);
+
   sessionMetaEl.textContent = parts.length > 0 ? parts.join(" | ") : "Session info will appear here.";
 }
 
@@ -375,10 +422,15 @@ function updateSessionMetaFromState(state: any): void {
     changed = true;
   }
 
-  const sessionName = typeof state.sessionName === "string" ? state.sessionName : "";
-  const usage = sessionName ? `session:${sessionName}` : "";
-  if (sessionMeta.usage !== usage) {
-    sessionMeta.usage = usage;
+  const sessionName = typeof state.sessionName === "string" ? state.sessionName : sessionMeta.sessionName;
+  if (sessionMeta.sessionName !== sessionName) {
+    sessionMeta.sessionName = sessionName;
+    changed = true;
+  }
+
+  const sessionId = typeof state.sessionId === "string" ? state.sessionId : sessionMeta.sessionId;
+  if (sessionMeta.sessionId !== sessionId) {
+    sessionMeta.sessionId = sessionId;
     changed = true;
   }
 
@@ -397,6 +449,24 @@ function updateSessionMetaFromState(state: any): void {
     changed = true;
   }
 
+  const messageCount =
+    typeof state.messageCount === "number" && Number.isFinite(state.messageCount)
+      ? state.messageCount
+      : sessionMeta.messageCount;
+  if (sessionMeta.messageCount !== messageCount) {
+    sessionMeta.messageCount = messageCount;
+    changed = true;
+  }
+
+  const pendingMessageCount =
+    typeof state.pendingMessageCount === "number" && Number.isFinite(state.pendingMessageCount)
+      ? state.pendingMessageCount
+      : sessionMeta.pendingMessageCount;
+  if (sessionMeta.pendingMessageCount !== pendingMessageCount) {
+    sessionMeta.pendingMessageCount = pendingMessageCount;
+    changed = true;
+  }
+
   if (changed) renderSessionMeta();
 }
 
@@ -406,6 +476,7 @@ function resetAgentStreamState(): void {
   agentRpcReplyBuffer = "";
   activeToolMessageEl = null;
   activeRetryMessageEl = null;
+  activeToolArgs = null;
   updateChatControlsState();
 }
 
@@ -429,36 +500,194 @@ function summarizeToolArgs(args: Record<string, unknown> | undefined): string {
   return "";
 }
 
-function setToolActivityMessage(text: string): void {
+function truncateInlineText(value: string, maxLength = 120): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (compact.length <= maxLength) return compact;
+  return `${compact.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function getRecordString(value: unknown, keys: string[]): string {
+  if (!value || typeof value !== "object") return "";
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
+    const candidate = record[key];
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate;
+    }
+  }
+  return "";
+}
+
+function getRecordNumber(value: unknown, keys: string[]): number | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
+    const candidate = record[key];
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function getRecordArrayLength(value: unknown, keys: string[]): number | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
+    const candidate = record[key];
+    if (Array.isArray(candidate)) {
+      return candidate.length;
+    }
+  }
+  return null;
+}
+
+function countTextLines(value: string): number {
+  if (!value) return 0;
+  return value.split(/\r?\n/).length;
+}
+
+function summarizeToolSuccess(
+  toolName: string,
+  args: Record<string, unknown> | undefined,
+  result: unknown,
+): string {
+  const normalized = toolName.toLowerCase();
+  const detail = summarizeToolArgs(args);
+  const path =
+    detail || getRecordString(result, ["filePath", "path", "newPath", "targetPath", "outputPath"]);
+
+  if (normalized === "read") {
+    const content = getRecordString(result, ["content", "text", "output"]);
+    if (path && content) {
+      return `Read ${path} (${countTextLines(content)} lines).`;
+    }
+    if (path) return `Read ${path}.`;
+    return "Read completed.";
+  }
+
+  if (normalized === "write") {
+    const content = getRecordString(result, ["content", "text"]);
+    if (path && content) {
+      return `Wrote ${path} (${content.length} chars).`;
+    }
+    if (path) return `Wrote ${path}.`;
+    return "Write completed.";
+  }
+
+  if (normalized === "edit") {
+    const changes =
+      getRecordNumber(result, ["changeCount", "editCount", "replacementCount", "modifiedLineCount"]) ??
+      getRecordArrayLength(result, ["changes", "edits", "replacements"]);
+    if (path && typeof changes === "number") {
+      return `Edited ${path} (${changes} changes).`;
+    }
+    if (path) return `Edited ${path}.`;
+    return "Edit completed.";
+  }
+
+  if (normalized === "bash") {
+    const command = detail || getRecordString(result, ["command", "cmd"]);
+    const exitCode = getRecordNumber(result, ["exitCode", "code", "status"]);
+    const excerpt = truncateInlineText(
+      getRecordString(result, ["stderr", "stdout", "output", "message"]),
+      100,
+    );
+    const commandLabel = command ? `: ${truncateInlineText(command, 72)}` : "";
+    const exitLabel = typeof exitCode === "number" ? ` (exit ${exitCode})` : "";
+    if (excerpt) {
+      return `bash completed${commandLabel}${exitLabel}. ${excerpt}`;
+    }
+    return `bash completed${commandLabel}${exitLabel}.`;
+  }
+
+  if (normalized === "search" || normalized === "find" || normalized === "grep") {
+    const matches =
+      getRecordNumber(result, ["matchCount", "count", "totalMatches"]) ??
+      getRecordArrayLength(result, ["matches", "results", "files"]);
+    if (detail && typeof matches === "number") {
+      return `${toolName} found ${matches} matches for ${detail}.`;
+    }
+    if (typeof matches === "number") {
+      return `${toolName} found ${matches} matches.`;
+    }
+  }
+
+  const message = getRecordString(result, ["message", "summary"]);
+  if (message) {
+    return `${toolName} completed. ${truncateInlineText(message, 100)}`;
+  }
+
+  if (detail) {
+    return `${toolName} completed: ${truncateInlineText(detail, 88)}.`;
+  }
+
+  return `${toolName} completed.`;
+}
+
+function summarizeToolFailure(
+  toolName: string,
+  args: Record<string, unknown> | undefined,
+  result: unknown,
+): string {
+  const detail = summarizeToolArgs(args);
+  const message = truncateInlineText(
+    getRecordString(result, ["error", "message", "stderr", "output"]),
+    120,
+  );
+
+  if (message && detail) {
+    return `${toolName} failed for ${truncateInlineText(detail, 72)}. ${message}`;
+  }
+  if (message) {
+    return `${toolName} failed. ${message}`;
+  }
+  if (detail) {
+    return `${toolName} failed for ${truncateInlineText(detail, 72)}.`;
+  }
+  return `${toolName} reported an error.`;
+}
+
+function formatToolLabel(toolName: string): string {
+  return `Tool · ${toolName}`;
+}
+
+function setToolActivityMessage(text: string, toolName = "tool"): void {
+  const label = formatToolLabel(toolName);
   if (!activeToolMessageEl) {
-    activeToolMessageEl = appendChatMessage("system", text);
+    activeToolMessageEl = appendSystemStatusMessage(text, "tool", label);
     return;
   }
+  setSystemMessageVariant(activeToolMessageEl, "tool", label);
   updateChatMessage(activeToolMessageEl, text);
 }
 
-function closeToolActivityMessage(text: string): void {
+function closeToolActivityMessage(text: string, toolName = "tool"): void {
+  const label = formatToolLabel(toolName);
   if (!activeToolMessageEl) {
-    appendChatMessage("system", text);
+    appendSystemStatusMessage(text, "tool", label);
     return;
   }
+  setSystemMessageVariant(activeToolMessageEl, "tool", label);
   updateChatMessage(activeToolMessageEl, text);
   activeToolMessageEl = null;
 }
 
 function setRetryActivityMessage(text: string): void {
   if (!activeRetryMessageEl) {
-    activeRetryMessageEl = appendChatMessage("system", text);
+    activeRetryMessageEl = appendSystemStatusMessage(text, "retry", "Retry");
     return;
   }
+  setSystemMessageVariant(activeRetryMessageEl, "retry", "Retry");
   updateChatMessage(activeRetryMessageEl, text);
 }
 
 function closeRetryActivityMessage(text: string): void {
   if (!activeRetryMessageEl) {
-    appendChatMessage("system", text);
+    appendSystemStatusMessage(text, "retry", "Retry");
     return;
   }
+  setSystemMessageVariant(activeRetryMessageEl, "retry", "Retry");
   updateChatMessage(activeRetryMessageEl, text);
   activeRetryMessageEl = null;
 }
@@ -487,8 +716,11 @@ function stopAgentRpcProcess(resetSession = true): void {
   if (resetSession) {
     agentSessionStarted = false;
     sessionMeta.cwd = "";
-    sessionMeta.usage = "";
+    sessionMeta.sessionName = "";
+    sessionMeta.sessionId = "";
     sessionMeta.model = "";
+    sessionMeta.messageCount = null;
+    sessionMeta.pendingMessageCount = null;
     renderSessionMeta();
   }
 }
@@ -619,9 +851,11 @@ function handleAgentRpcEvent(event: AgentRpcEvent): void {
     case "tool_execution_start":
       if (awaitingAgentReply) {
         const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+        activeToolArgs = event.args ?? null;
         const detail = summarizeToolArgs(event.args);
         setToolActivityMessage(
           detail ? `Running ${toolName}: ${detail}` : `Running ${toolName}...`,
+          toolName,
         );
         setStatus(`Running ${toolName}...`, "loading");
       }
@@ -630,11 +864,16 @@ function handleAgentRpcEvent(event: AgentRpcEvent): void {
       if (awaitingAgentReply) {
         const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
         if (event.isError) {
-          closeToolActivityMessage(`${toolName} reported an error.`);
-          setStatus(`${toolName} reported an error.`, "error");
+          const summary = summarizeToolFailure(toolName, activeToolArgs ?? undefined, event.result);
+          closeToolActivityMessage(summary, toolName);
+          setStatus(summary, "error");
         } else {
-          closeToolActivityMessage(`${toolName} completed.`);
+          closeToolActivityMessage(
+            summarizeToolSuccess(toolName, activeToolArgs ?? undefined, event.result),
+            toolName,
+          );
         }
+        activeToolArgs = null;
       }
       break;
     case "auto_retry_start":
