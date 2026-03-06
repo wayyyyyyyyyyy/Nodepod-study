@@ -27,6 +27,41 @@ Built by [@R1ck404](https://github.com/R1ck404) — powering [Scelar](https://sc
 npm install @scelar/nodepod
 ```
 
+## Run LiveNode Agent
+
+This fork also includes **LiveNode Agent**, a browser UI built on top of Nodepod.
+
+If someone clones this repository or your fork and wants to run the LiveNode Agent locally, the startup flow is:
+
+```bash
+git clone https://github.com/wayyyyyyyyyyy/Nodepod-study.git
+cd Nodepod-study
+npm install
+npm run dev:demo
+```
+
+Then open:
+
+```text
+http://127.0.0.1:5174/
+```
+
+Inside the page, the normal usage flow is:
+
+1. `Install Agent`
+2. `Configure Env`
+3. `Start CLI`
+
+Important:
+
+- You do **not** need to start a separate Nodepod service first.
+- `npm run dev:demo` starts the Vite app, and the browser page boots the Nodepod runtime internally when you begin the agent flow.
+- After dependencies are already installed, the only command needed to start the local service again is:
+
+```bash
+npm run dev:demo
+```
+
 ## Quick Start
 
 ```typescript
@@ -224,7 +259,9 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for setup instructions and guidelines.
 
 ## Author
 
-Created by [@R1ck404](https://github.com/R1ck404). Part of the [Scelar](https://scelar.com) ecosystem.
+Upstream **Nodepod** was created by [@R1ck404](https://github.com/R1ck404) and is part of the [Scelar](https://scelar.com) ecosystem.
+
+This fork's **LiveNode Agent** experience, browser agent workflow, and related UI adaptations are maintained by [@wayyyyyyyyyyy](https://github.com/wayyyyyyyyyyy).
 
 ## License
 
