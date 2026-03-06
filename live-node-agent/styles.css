@@ -237,6 +237,18 @@ button:disabled {
   background: linear-gradient(180deg, rgba(107, 128, 154, 0.96) 0%, rgba(74, 91, 115, 0.96) 100%);
 }
 
+#stop-session-btn {
+  background: linear-gradient(180deg, rgba(181, 102, 102, 0.95) 0%, rgba(140, 72, 72, 0.95) 100%);
+}
+
+#reconnect-session-btn {
+  background: linear-gradient(180deg, rgba(96, 128, 165, 0.96) 0%, rgba(63, 92, 129, 0.96) 100%);
+}
+
+#clear-conversation-btn {
+  background: linear-gradient(180deg, rgba(125, 138, 154, 0.95) 0%, rgba(89, 101, 118, 0.95) 100%);
+}
+
 #clear-btn {
   background: linear-gradient(180deg, rgba(232, 127, 70, 0.95) 0%, rgba(189, 91, 46, 0.95) 100%);
 }

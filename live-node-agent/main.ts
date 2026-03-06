@@ -9,6 +9,11 @@ const installBtn = document.querySelector("#install-btn") as HTMLButtonElement;
 const applyEnvBtn = document.querySelector("#apply-env-btn") as HTMLButtonElement;
 const startAgentBtn = document.querySelector("#start-agent-btn") as HTMLButtonElement;
 const newSessionBtn = document.querySelector("#new-session-btn") as HTMLButtonElement;
+const stopSessionBtn = document.querySelector("#stop-session-btn") as HTMLButtonElement;
+const reconnectSessionBtn = document.querySelector("#reconnect-session-btn") as HTMLButtonElement;
+const clearConversationBtn = document.querySelector(
+  "#clear-conversation-btn",
+) as HTMLButtonElement;
 const toggleTerminalBtn = document.querySelector("#toggle-terminal-btn") as HTMLButtonElement;
 const runBtn = document.querySelector("#run-btn") as HTMLButtonElement;
 const clearBtn = document.querySelector("#clear-btn") as HTMLButtonElement;
@@ -131,6 +136,7 @@ let pendingInstallSentinelPath: string | null = null;
 let installPollTimer: number | null = null;
 let installPollStartedAt = 0;
 let pendingStart = false;
+let pendingReconnect = false;
 let startWatchdogTimer: number | null = null;
 let awaitingAgentReply = false;
 let pendingSessionReset = false;
@@ -148,6 +154,7 @@ let agentRpcStartRequestId: string | null = null;
 let agentRpcNewSessionRequestId: string | null = null;
 let agentRpcCurrentPromptId: string | null = null;
 let agentRpcReplyBuffer = "";
+let lastKnownSessionFile: string | null = null;
 let activeToolMessageEl: HTMLDivElement | null = null;
 let activeRetryMessageEl: HTMLDivElement | null = null;
 let activeToolArgs: Record<string, unknown> | null = null;
@@ -163,9 +170,21 @@ const sessionMeta: SessionMeta = {
 
 function updateChatControlsState(): void {
   const canChat = agentSessionStarted && !pendingSessionReset;
+  const canManageSession = canChat && !awaitingAgentReply && !pendingStart;
+  const canReconnect =
+    !!appliedConfig &&
+    installReady &&
+    !pendingStart &&
+    !pendingSessionReset &&
+    !awaitingAgentReply &&
+    !agentSessionStarted &&
+    !!lastKnownSessionFile;
   cmdInput.disabled = !canChat;
   runBtn.disabled = !canChat || awaitingAgentReply;
-  newSessionBtn.disabled = !canChat || awaitingAgentReply || pendingStart;
+  newSessionBtn.disabled = !canManageSession;
+  stopSessionBtn.disabled = !canManageSession;
+  reconnectSessionBtn.disabled = !canReconnect;
+  clearConversationBtn.disabled = chatLogEl.childElementCount === 0 || awaitingAgentReply;
   renderSessionMeta();
 }
 
@@ -319,12 +338,14 @@ function appendChatMessage(role: "system" | "user" | "agent", text: string): HTM
   const message = createChatMessage(role, text);
   chatLogEl.appendChild(message);
   scrollChatToBottom();
+  updateChatControlsState();
   return message;
 }
 
 function updateChatMessage(message: HTMLDivElement, text: string): void {
   message.textContent = text;
   scrollChatToBottom();
+  updateChatControlsState();
 }
 
 function setSystemMessageVariant(
@@ -526,6 +547,11 @@ function updateSessionMetaFromState(state: any): void {
   if (sessionMeta.pendingMessageCount !== pendingMessageCount) {
     sessionMeta.pendingMessageCount = pendingMessageCount;
     changed = true;
+  }
+
+  const sessionFile = typeof state.sessionFile === "string" ? state.sessionFile : "";
+  if (sessionFile) {
+    lastKnownSessionFile = sessionFile;
   }
 
   if (changed) renderSessionMeta();
@@ -781,6 +807,7 @@ function stopAgentRpcProcess(resetSession = true): void {
   agentRpcStdoutBuffer = "";
   agentRpcStartRequestId = null;
   agentRpcNewSessionRequestId = null;
+  pendingReconnect = false;
   pendingSessionReset = false;
   resetAgentStreamState();
 
@@ -832,8 +859,8 @@ function buildAgentRpcEnv(config: AgentConfig): Record<string, string> {
   };
 }
 
-function buildAgentRpcArgs(config: AgentConfig): string[] {
-  return [
+function buildAgentRpcArgs(config: AgentConfig, sessionFile?: string | null): string[] {
+  const args = [
     PI_AGENT_CLI_PATH,
     "--mode",
     "rpc",
@@ -842,6 +869,10 @@ function buildAgentRpcArgs(config: AgentConfig): string[] {
     "--model",
     config.modelId,
   ];
+  if (sessionFile) {
+    args.push("--session", sessionFile);
+  }
+  return args;
 }
 
 function sendAgentRpcRequest(request: AgentRpcRequest): void {
@@ -993,8 +1024,13 @@ function handleAgentRpcResponse(response: AgentRpcResponse): void {
     if (response.success) {
       updateSessionMetaFromState(response.data);
       finishStartSuccess();
-      setStatus("Agent RPC session started.", "success");
-      appendChatMessage("system", "Agent session started in structured RPC mode.");
+      if (pendingReconnect) {
+        setStatus("Agent session reconnected.", "success");
+        appendChatMessage("system", "Reconnected to the previous agent session.");
+      } else {
+        setStatus("Agent RPC session started.", "success");
+        appendChatMessage("system", "Agent session started in structured RPC mode.");
+      }
     } else {
       const message = response.error?.message || "Agent CLI start failed.";
       finishStartError(message);
@@ -1180,7 +1216,10 @@ function queueAgentPrompt(prompt: string): void {
   }
 }
 
-async function startAgentRpcSession(config: AgentConfig): Promise<void> {
+async function startAgentRpcSession(
+  config: AgentConfig,
+  sessionFile: string | null = null,
+): Promise<void> {
   if (!nodepod) throw new Error("Nodepod runtime is not ready.");
 
   stopAgentRpcProcess(false);
@@ -1190,7 +1229,7 @@ async function startAgentRpcSession(config: AgentConfig): Promise<void> {
   clearStartWatchdog();
   setStatus("Starting Agent RPC session...", "loading");
 
-  const proc = await nodepod.spawn("node", buildAgentRpcArgs(config), {
+  const proc = await nodepod.spawn("node", buildAgentRpcArgs(config, sessionFile), {
     cwd: "/workspace",
     env: buildAgentRpcEnv(config),
   });
@@ -1305,6 +1344,7 @@ function clearStartWatchdog(): void {
 
 function finishStartSuccess(): void {
   pendingStart = false;
+  pendingReconnect = false;
   clearStartWatchdog();
   updateStartButtonState();
   agentSessionStarted = true;
@@ -1314,6 +1354,7 @@ function finishStartSuccess(): void {
 
 function finishStartError(message: string): void {
   pendingStart = false;
+  pendingReconnect = false;
   clearStartWatchdog();
   updateStartButtonState();
   agentSessionStarted = false;
@@ -1859,6 +1900,61 @@ newSessionBtn.addEventListener("click", () => {
     return;
   }
   beginSessionReset();
+});
+
+stopSessionBtn.addEventListener("click", () => {
+  if (!agentSessionStarted || !agentRpcProcess || agentRpcProcess.exited) {
+    setStatus("Agent session is not running.", "idle");
+    return;
+  }
+
+  stopAgentRpcProcess(false);
+  agentSessionStarted = false;
+  updateChatControlsState();
+  setStatus("Agent session stopped.", "success");
+  appendChatMessage(
+    "system",
+    lastKnownSessionFile
+      ? "Agent session stopped. Use Reconnect to reopen the last session."
+      : "Agent session stopped.",
+  );
+});
+
+reconnectSessionBtn.addEventListener("click", async () => {
+  if (!appliedConfig) {
+    setStatus("Apply Agent Env first.", "idle");
+    return;
+  }
+  if (!installReady) {
+    setStatus("Install must complete before reconnecting.", "idle");
+    return;
+  }
+  if (!lastKnownSessionFile) {
+    setStatus("No previous session is available to reconnect.", "idle");
+    return;
+  }
+  if (agentSessionStarted || pendingStart || pendingSessionReset || awaitingAgentReply) {
+    return;
+  }
+
+  syncRuntimeEnv(appliedConfig);
+  setActiveTerminal("agent");
+  pendingReconnect = true;
+  try {
+    await startAgentRpcSession(appliedConfig, lastKnownSessionFile);
+  } catch (err) {
+    pendingReconnect = false;
+    const message = err instanceof Error ? err.message : String(err);
+    finishStartError(message);
+    stopAgentRpcProcess(false);
+  }
+});
+
+clearConversationBtn.addEventListener("click", () => {
+  if (awaitingAgentReply) return;
+  chatLogEl.innerHTML = "";
+  updateChatControlsState();
+  setStatus("Conversation view cleared. Agent session history is unchanged.", "success");
 });
 
 runBtn.addEventListener("click", () => {
