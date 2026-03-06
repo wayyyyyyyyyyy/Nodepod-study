@@ -1,4 +1,4 @@
-import { Nodepod, NodepodTerminal } from "../src/index";
+import { Nodepod, NodepodProcess, NodepodTerminal } from "../src/index";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -41,45 +41,15 @@ const modelIdInput = document.querySelector("#model-id-input") as HTMLInputEleme
 
 const DEFAULT_BASE_URL = "https://api.moonshot.cn/v1";
 const DEFAULT_MODEL_ID = "kimi-k2-turbo-preview";
+const PI_AGENT_HOME = "/home/user/.pi/agent";
+const PI_AGENT_CLI_PATH =
+  "/home/user/.pi/agent/node_modules/@mariozechner/pi-coding-agent/dist/cli.js";
 const MAX_TREE_DEPTH = 4;
 const MAX_DIR_ITEMS = 80;
 const SKIP_RECURSE_DIRS = new Set(["node_modules", ".git"]);
 const FILE_TREE_AUTO_REFRESH_MS = 12000;
-const AGENT_REPLY_IDLE_MS = 1200;
-const AGENT_REPLY_RECHECK_MS = 300;
 const AGENT_STREAM_BUFFER_LIMIT = 120000;
-const AGENT_NOISE_PATTERNS: RegExp[] = [
-  /^escape to interrupt$/i,
-  /^ctrl\+c to clear$/i,
-  /^ctrl\+c twice to exit$/i,
-  /^ctrl\+d to exit/i,
-  /^ctrl\+z to suspend$/i,
-  /^ctrl\+k to delete to end$/i,
-  /^shift\+tab to cycle thinking level$/i,
-  /^ctrl\+p\/shift\+ctrl\+p to cycle models$/i,
-  /^ctrl\+l to select model$/i,
-  /^ctrl\+o to expand tools$/i,
-  /^ctrl\+t to expand thinking$/i,
-  /^ctrl\+g for external editor$/i,
-  /^\/ for commands$/i,
-  /^! to run bash$/i,
-  /^!! to run bash/i,
-  /^alt\+enter to queue follow-up$/i,
-  /^alt\+up to edit all queued messages$/i,
-  /^ctrl\+v to paste image$/i,
-  /^drop files to attach$/i,
-  /^~\/\.pi\/agent$/i,
-  /^~\/\.pi\/agent8;;$/i,
-  /^nodepod:.*\$$/i,
-  /^\d+(\.\d+)?%\/\d+/,
-  /^↑\d+\s+↓\d+/,
-  /^[─━-]{20,}$/,
-  /^[⠋⠙⠧⠹⠸⠼⠴⠦⠇⠏]\s+Working\.\.\.$/,
-  /^[\w.-]+\s+[•·]\s+(?:low|medium|high)$/i,
-  /^pi v\d+\.\d+\.\d+$/i,
-];
-const CLI_USAGE_MODEL_REGEX =
-  /^(↑\d+\s+↓\d+\s+R\d+\s+[0-9.]+%\/[0-9.]+[kKmM]?\s+\(auto\))\s+(.+)$/;
+const AGENT_RPC_START_TIMEOUT_MS = 12000;
 
 type AgentConfig = {
   apiKey: string;
@@ -113,6 +83,36 @@ type PreviewTarget = {
 
 type TerminalKind = "agent" | "workspace";
 
+type AgentRpcRequest =
+  | { id: string; type: "get_state" | "new_session" }
+  | { id: string; type: "prompt"; message: string }
+  | { id: string; type: "extension_ui_response"; cancelled: true }
+  | { id: string; type: "extension_ui_response"; confirmed: boolean }
+  | { id: string; type: "extension_ui_response"; value: string };
+
+type AgentRpcResponse = {
+  type: "response";
+  id: string;
+  command?: string;
+  success: boolean;
+  data?: unknown;
+  error?: {
+    message?: string;
+  };
+};
+
+type AgentRpcEvent =
+  | { type: "agent_start" }
+  | { type: "agent_end"; messages?: any[] }
+  | { type: "message_update"; message?: any; assistantMessageEvent?: any }
+  | { type: "tool_execution_start"; toolName?: string; args?: Record<string, unknown> }
+  | { type: "tool_execution_update"; toolName?: string; partialResult?: any }
+  | { type: "tool_execution_end"; toolName?: string; result?: any; isError?: boolean }
+  | { type: "auto_retry_start"; attempt?: number; maxAttempts?: number; delayMs?: number; errorMessage?: string }
+  | { type: "auto_retry_end"; success?: boolean; attempt?: number; finalError?: string }
+  | { type: "extension_ui_request"; id: string; method: string; [key: string]: unknown }
+  | { type: "extension_error"; error?: string; extensionPath?: string; event?: string };
+
 let nodepod: Nodepod | null = null;
 let agentTerminal: NodepodTerminal | null = null;
 let workspaceTerminal: NodepodTerminal | null = null;
@@ -125,15 +125,8 @@ let pendingInstallSentinelPath: string | null = null;
 let installPollTimer: number | null = null;
 let installPollStartedAt = 0;
 let pendingStart = false;
-let pendingStartBuffer = "";
 let startWatchdogTimer: number | null = null;
-let agentTranscript = "";
-let agentSettleTimer: number | null = null;
 let awaitingAgentReply = false;
-let agentEscapeCarry = "";
-let lastUserPrompt = "";
-let agentExtractCursor = 0;
-let agentReplyStartedAt = 0;
 let selectedTreePath: string | null = null;
 let selectedTreeIsDirectory = false;
 let fileTreeRefreshInFlight = false;
@@ -141,6 +134,12 @@ let fileTreeAutoRefreshTimer: number | null = null;
 let previewState: PreviewState = "idle";
 let previewMessage = "Run a local server in the terminal to open a live preview.";
 let activePreview: PreviewTarget | null = null;
+let agentRpcProcess: NodepodProcess | null = null;
+let agentRpcStdoutBuffer = "";
+let agentRpcRequestSeq = 0;
+let agentRpcStartRequestId: string | null = null;
+let agentRpcCurrentPromptId: string | null = null;
+let agentRpcReplyBuffer = "";
 const announcedPreviewPorts = new Set<number>();
 const sessionMeta: SessionMeta = {
   cwd: "",
@@ -186,7 +185,7 @@ function updateTerminalTabState(): void {
 
   terminalHintEl.textContent =
     activeTerminalKind === "agent"
-      ? "Agent Terminal is reserved for install logs and the running CLI."
+      ? "Agent Terminal is reserved for install logs and RPC debug output."
       : "Workspace Terminal is for manual commands like vite, npm, and git.";
 }
 
@@ -287,80 +286,6 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-function stripBackspaces(value: string): string {
-  let out = "";
-  for (const ch of value) {
-    if (ch === "\b") {
-      out = out.slice(0, -1);
-      continue;
-    }
-    out += ch;
-  }
-  return out;
-}
-
-function splitIncompleteEscapeTail(input: string): { text: string; carry: string } {
-  if (!input) return { text: input, carry: "" };
-
-  let text = input;
-  let carry = "";
-
-  const oscStart = text.lastIndexOf("\x1b]");
-  if (oscStart !== -1) {
-    const tail = text.slice(oscStart);
-    const hasBel = tail.includes("\x07");
-    const hasSt = tail.includes("\x1b\\");
-    if (!hasBel && !hasSt) {
-      carry = tail;
-      text = text.slice(0, oscStart);
-      return { text, carry };
-    }
-  }
-
-  const csiTail = text.match(/\x1b\[[0-?]*[ -/]*$/);
-  if (csiTail) {
-    carry = csiTail[0];
-    text = text.slice(0, -carry.length);
-    return { text, carry };
-  }
-
-  if (text.endsWith("\x1b")) {
-    carry = "\x1b";
-    text = text.slice(0, -1);
-  }
-
-  return { text, carry };
-}
-
-function normalizeAgentChunk(raw: string): string {
-  if (!raw) return "";
-
-  let source = agentEscapeCarry + raw;
-  const { text, carry } = splitIncompleteEscapeTail(source);
-  source = text;
-  agentEscapeCarry = carry;
-
-  // Strip OSC first (e.g. OSC 8 hyperlinks), then generic ANSI.
-  source = source
-    .replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
-    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/\x1b[@-Z\\-_]/g, "")
-    .replace(/\x1b\[200~/g, "")
-    .replace(/\x1b\[201~/g, "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n");
-
-  const clean = stripBackspaces(
-    source
-      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001a\u001c-\u001f\u007f]/g, "")
-      .replace(/\]?8;;/g, ""),
-  );
-
-  if (!clean) return "";
-  return clean.length > AGENT_STREAM_BUFFER_LIMIT ? clean.slice(-AGENT_STREAM_BUFFER_LIMIT) : clean;
-}
-
 function scrollChatToBottom(): void {
   chatLogEl.scrollTop = chatLogEl.scrollHeight;
 }
@@ -419,13 +344,6 @@ function startFileTreeAutoRefresh(): void {
   }, FILE_TREE_AUTO_REFRESH_MS);
 }
 
-function clearAgentSettleTimer(): void {
-  if (agentSettleTimer !== null) {
-    window.clearTimeout(agentSettleTimer);
-    agentSettleTimer = null;
-  }
-}
-
 function renderSessionMeta(): void {
   if (!sessionMetaEl) return;
   const parts: string[] = [];
@@ -435,267 +353,433 @@ function renderSessionMeta(): void {
   sessionMetaEl.textContent = parts.length > 0 ? parts.join(" | ") : "Session info will appear here.";
 }
 
-function updateSessionMetaFromChunk(clean: string): void {
-  const lines = clean
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-
+function updateSessionMetaFromState(state: any): void {
+  if (!state || typeof state !== "object") return;
   let changed = false;
-  for (const line of lines) {
-    if (/^~\/\S+/.test(line) && sessionMeta.cwd !== line) {
-      sessionMeta.cwd = line;
-      changed = true;
-      continue;
-    }
 
-    const usageModel = line.match(CLI_USAGE_MODEL_REGEX);
-    if (usageModel) {
-      if (sessionMeta.usage !== usageModel[1]) {
-        sessionMeta.usage = usageModel[1];
-        changed = true;
-      }
-      const model = usageModel[2].trim();
-      if (model && sessionMeta.model !== model) {
-        sessionMeta.model = model;
-        changed = true;
-      }
-      continue;
-    }
+  const cwd = typeof state.cwd === "string" ? state.cwd : "";
+  if (cwd && sessionMeta.cwd !== cwd) {
+    sessionMeta.cwd = cwd;
+    changed = true;
+  }
+
+  const sessionName = typeof state.sessionName === "string" ? state.sessionName : "";
+  const usage = sessionName ? `session:${sessionName}` : "";
+  if (sessionMeta.usage !== usage) {
+    sessionMeta.usage = usage;
+    changed = true;
+  }
+
+  const model =
+    typeof state.modelName === "string"
+      ? state.modelName
+      : typeof state.model === "string"
+        ? state.model
+        : typeof state.model?.name === "string"
+          ? state.model.name
+          : typeof state.model?.id === "string"
+            ? state.model.id
+            : "";
+  if (model && sessionMeta.model !== model) {
+    sessionMeta.model = model;
+    changed = true;
   }
 
   if (changed) renderSessionMeta();
 }
 
 function resetAgentStreamState(): void {
-  clearAgentSettleTimer();
-  agentTranscript = "";
   awaitingAgentReply = false;
-  lastUserPrompt = "";
-  agentEscapeCarry = "";
-  agentExtractCursor = 0;
-  agentReplyStartedAt = 0;
+  agentRpcCurrentPromptId = null;
+  agentRpcReplyBuffer = "";
+  updateChatControlsState();
 }
 
-function shouldIgnoreAgentLine(trimmedLine: string): boolean {
-  if (!trimmedLine) return true;
-  return AGENT_NOISE_PATTERNS.some((pattern) => pattern.test(trimmedLine));
+function nextAgentRpcId(prefix: string): string {
+  agentRpcRequestSeq += 1;
+  return `${prefix}-${agentRpcRequestSeq}`;
 }
 
-function isLikelyIncrementalFrame(prevRaw: string, nextRaw: string): boolean {
-  const prev = prevRaw.trim();
-  const next = nextRaw.trim();
-  if (!prev || !next) return false;
-
-  if (/^\s*[-*]\s/.test(prevRaw) || /^\s*[-*]\s/.test(nextRaw)) return false;
-
-  const shorter = prev.length <= next.length ? prev : next;
-  const longer = prev.length <= next.length ? next : prev;
-  if (!longer.startsWith(shorter)) return false;
-
-  const delta = longer.length - shorter.length;
-  return delta > 0 && delta <= 24;
+function writeAgentTerminalLog(text: string): void {
+  if (!text || !agentTerminal) return;
+  agentTerminal.write(text.replace(/\n/g, "\r\n"));
 }
 
-function normalizeExtractedLines(lines: string[], promptText: string): string {
-  const kept: string[] = [];
-  for (const rawLine of lines) {
-    const trimmed = rawLine.trim();
-    if (!trimmed) {
-      if (kept.length > 0 && kept[kept.length - 1] !== "") kept.push("");
-      continue;
-    }
-    if (promptText && trimmed === promptText) continue;
-    if (shouldIgnoreAgentLine(trimmed)) continue;
-    kept.push(rawLine);
+function stopAgentRpcProcess(resetSession = true): void {
+  if (agentRpcProcess && !agentRpcProcess.exited) {
+    agentRpcProcess.kill();
+  }
+  agentRpcProcess = null;
+  agentRpcStdoutBuffer = "";
+  agentRpcStartRequestId = null;
+  resetAgentStreamState();
+
+  if (resetSession) {
+    agentSessionStarted = false;
+    sessionMeta.cwd = "";
+    sessionMeta.usage = "";
+    sessionMeta.model = "";
+    renderSessionMeta();
+  }
+}
+
+function buildAgentRpcEnv(config: AgentConfig): Record<string, string> {
+  return {
+    HOME: "/home/user",
+    NODEPOD_NO_INTERACTIVE_TIMEOUT: "1",
+    PI_API_KEY: config.apiKey,
+    PI_BASE_URL: config.baseUrl,
+    PI_MODEL_ID: config.modelId,
+  };
+}
+
+function buildAgentRpcArgs(config: AgentConfig): string[] {
+  return [
+    PI_AGENT_CLI_PATH,
+    "--mode",
+    "rpc",
+    "--provider",
+    "custom-openai",
+    "--model",
+    config.modelId,
+  ];
+}
+
+function sendAgentRpcRequest(request: AgentRpcRequest): void {
+  if (!agentRpcProcess || agentRpcProcess.exited) {
+    throw new Error("Agent RPC process is not running.");
+  }
+  agentRpcProcess.write(`${JSON.stringify(request)}\n`);
+}
+
+function finalizeAgentReply(messages?: any[]): void {
+  const fromEvents = agentRpcReplyBuffer.trim();
+  let finalText = fromEvents;
+  if (!finalText && Array.isArray(messages)) {
+    finalText = messages
+      .filter((message) => message?.role === "assistant")
+      .flatMap((message) => (Array.isArray(message?.content) ? message.content : []))
+      .map((item) => (item?.type === "text" && typeof item.text === "string" ? item.text : ""))
+      .join("")
+      .trim();
   }
 
-  const deduped: string[] = [];
-  for (const rawLine of kept) {
-    const line = rawLine.trim();
-    if (deduped.length === 0) {
-      deduped.push(rawLine);
-      continue;
-    }
-
-    const prevRaw = deduped[deduped.length - 1];
-    const prev = prevRaw.trim();
-
-    if (!line && !prev) continue;
-    if (line === prev) continue;
-
-    if (isLikelyIncrementalFrame(prevRaw, rawLine)) {
-      deduped[deduped.length - 1] = line.length >= prev.length ? rawLine : prevRaw;
-      continue;
-    }
-
-    deduped.push(rawLine);
+  resetAgentStreamState();
+  if (finalText) {
+    appendChatMessage("agent", finalText);
+  } else {
+    appendChatMessage("system", "Agent finished without a text reply.");
   }
-
-  while (deduped.length > 0 && deduped[0] === "") deduped.shift();
-  while (deduped.length > 0 && deduped[deduped.length - 1] === "") deduped.pop();
-  return deduped.join("\n").trim();
+  setStatus("Agent ready.", "success");
 }
 
-function extractFinalAgentText(
-  transcript: string,
-  cursor: number,
-  prompt: string,
-): { text: string; nextCursor: number } {
-  const promptText = prompt.trim();
-  const safeCursor = Math.max(0, Math.min(cursor, transcript.length));
-  const scoped = transcript.slice(safeCursor);
-  if (!scoped.trim()) {
-    return { text: "", nextCursor: transcript.length };
+function respondToUnsupportedDialog(event: Extract<AgentRpcEvent, { type: "extension_ui_request" }>): void {
+  if (event.method === "notify" && typeof event.message === "string") {
+    appendChatMessage("system", event.message);
+    return;
   }
 
-  const scopedLines = scoped.split("\n");
-  let startLine = 0;
-  if (promptText) {
-    const promptLineAt = scopedLines.findIndex((line, idx) => idx < 8 && line.trim() === promptText);
-    if (promptLineAt !== -1) {
-      startLine = promptLineAt + 1;
-      while (startLine < scopedLines.length && scopedLines[startLine].trim() === "") {
-        startLine += 1;
+  if (event.method === "setStatus" && typeof event.statusText === "string") {
+    setStatus(event.statusText, "loading");
+    return;
+  }
+
+  if (!["select", "confirm", "input", "editor"].includes(event.method)) {
+    appendChatMessage("system", `Ignored extension UI request: ${event.method}`);
+    return;
+  }
+
+  appendChatMessage("system", `Unsupported extension dialog: ${event.method}`);
+  try {
+    sendAgentRpcRequest({
+      id: String(event.id),
+      type: "extension_ui_response",
+      cancelled: true,
+    });
+  } catch {
+    // Process is already gone; nothing left to do.
+  }
+}
+
+function handleAgentRpcEvent(event: AgentRpcEvent): void {
+  switch (event.type) {
+    case "agent_start":
+      if (awaitingAgentReply) {
+        setStatus("Agent is thinking...", "loading");
       }
+      break;
+    case "message_update":
+      if (!awaitingAgentReply) break;
+      if (event.assistantMessageEvent?.type === "text_delta") {
+        const delta = String(event.assistantMessageEvent.delta ?? "");
+        if (delta) {
+          agentRpcReplyBuffer += delta;
+          if (agentRpcReplyBuffer.length > AGENT_STREAM_BUFFER_LIMIT) {
+            agentRpcReplyBuffer = agentRpcReplyBuffer.slice(-AGENT_STREAM_BUFFER_LIMIT);
+          }
+        }
+      }
+      break;
+    case "tool_execution_start":
+      if (awaitingAgentReply) {
+        const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+        setStatus(`Running ${toolName}...`, "loading");
+      }
+      break;
+    case "tool_execution_end":
+      if (awaitingAgentReply && event.isError) {
+        const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+        setStatus(`${toolName} reported an error.`, "error");
+      }
+      break;
+    case "auto_retry_start":
+      if (awaitingAgentReply) {
+        const attempt = typeof event.attempt === "number" ? event.attempt : "?";
+        const maxAttempts = typeof event.maxAttempts === "number" ? event.maxAttempts : "?";
+        setStatus(`Retrying agent request (${attempt}/${maxAttempts})...`, "loading");
+      }
+      break;
+    case "auto_retry_end":
+      if (awaitingAgentReply && event.success === false && typeof event.finalError === "string") {
+        setStatus(`Retry failed: ${event.finalError}`, "error");
+      }
+      break;
+    case "extension_ui_request":
+      respondToUnsupportedDialog(event);
+      break;
+    case "extension_error":
+      if (typeof event.error === "string") {
+        appendChatMessage("system", `Extension error: ${event.error}`);
+      }
+      break;
+    case "agent_end":
+      if (awaitingAgentReply) {
+        finalizeAgentReply(event.messages);
+      }
+      try {
+        sendAgentRpcRequest({ id: nextAgentRpcId("get-state"), type: "get_state" });
+      } catch {
+        /* process exited */
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+function handleAgentRpcResponse(response: AgentRpcResponse): void {
+  if (response.id === agentRpcStartRequestId) {
+    if (response.success) {
+      updateSessionMetaFromState(response.data);
+      finishStartSuccess();
+      setStatus("Agent RPC session started.", "success");
+      appendChatMessage("system", "Agent session started in structured RPC mode.");
+    } else {
+      const message = response.error?.message || "Agent CLI start failed.";
+      finishStartError(message);
+    }
+    agentRpcStartRequestId = null;
+    return;
+  }
+
+  if (response.command === "get_state" || response.id.startsWith("get-state")) {
+    if (response.success) {
+      updateSessionMetaFromState(response.data);
+    }
+    return;
+  }
+
+  if (response.command === "prompt" || response.id === agentRpcCurrentPromptId) {
+    if (!response.success) {
+      const message = response.error?.message || "Agent request failed.";
+      resetAgentStreamState();
+      appendChatMessage("system", message);
+      setStatus(message, "error");
     }
   }
-
-  const extractedRaw = scopedLines.slice(startLine).join("\n");
-  const lines = extractedRaw
-    .split("\n")
-    .map((line) => line.replace(/[ \t]+$/g, ""));
-  const text = normalizeExtractedLines(lines, promptText);
-  return { text, nextCursor: transcript.length };
 }
 
-function readAgentTerminalText(): string {
-  const xterm = agentTerminal?.xterm as any;
-  const active = xterm?.buffer?.active;
-  if (!xterm || !active) return "";
-
-  const rows = typeof xterm.rows === "number" ? xterm.rows : 24;
-  const viewportY =
-    typeof active.viewportY === "number"
-      ? active.viewportY
-      : typeof active.ydisp === "number"
-        ? active.ydisp
-        : Math.max(0, (active.length ?? rows) - rows);
-  const start = Math.max(0, viewportY);
-  const end = Math.min((active.length ?? rows) - 1, start + rows - 1);
-  const lines: string[] = [];
-
-  for (let index = start; index <= end; index += 1) {
-    const line = active.getLine(index);
-    if (!line) continue;
-    lines.push(String(line.translateToString(true) ?? "").replace(/[ \t]+$/g, ""));
+function handleAgentRpcPayload(payload: AgentRpcResponse | AgentRpcEvent): void {
+  if (payload.type === "response") {
+    handleAgentRpcResponse(payload);
+    return;
   }
 
-  return lines.join("\n").trim();
+  handleAgentRpcEvent(payload);
 }
 
-function terminalReplyStillWorking(screenText: string): boolean {
-  return /(?:^|\n)\s*[⠋⠙⠧⠹⠸⠼⠴⠦⠇⠏]?\s*Working\.\.\.(?:\n|$)/i.test(screenText);
+function isAgentRpcPayload(value: any): value is AgentRpcResponse | AgentRpcEvent {
+  if (!value || typeof value !== "object") return false;
+  if (value.type === "response") return true;
+  return [
+    "agent_start",
+    "agent_end",
+    "message_update",
+    "tool_execution_start",
+    "tool_execution_update",
+    "tool_execution_end",
+    "auto_retry_start",
+    "auto_retry_end",
+    "extension_ui_request",
+    "extension_error",
+  ].includes(String(value.type));
 }
 
-function extractFinalAgentTextFromScreen(screenText: string, prompt: string): string {
-  if (!screenText.trim()) return "";
-  const promptText = prompt.trim();
-  const lines = screenText.split("\n").map((line) => line.replace(/[ \t]+$/g, ""));
+function findNextAgentRpcPacket(
+  buffer: string,
+): { payload: AgentRpcResponse | AgentRpcEvent; start: number; end: number } | null {
+  for (let start = buffer.indexOf("{"); start !== -1; start = buffer.indexOf("{", start + 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
 
-  if (!promptText) {
-    return normalizeExtractedLines(lines, "");
-  }
+    for (let index = start; index < buffer.length; index += 1) {
+      const ch = buffer[index];
 
-  let startLine = -1;
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (lines[index].trim() === promptText) {
-      startLine = index + 1;
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (ch === "\"") {
+        inString = true;
+        continue;
+      }
+
+      if (ch === "{") {
+        depth += 1;
+        continue;
+      }
+
+      if (ch !== "}") continue;
+
+      depth -= 1;
+      if (depth !== 0) continue;
+
+      const candidate = buffer.slice(start, index + 1);
+      try {
+        const parsed = JSON.parse(candidate);
+        if (isAgentRpcPayload(parsed)) {
+          return { payload: parsed, start, end: index + 1 };
+        }
+      } catch {
+        // Ignore malformed candidate and keep scanning.
+      }
       break;
     }
   }
-
-  if (startLine === -1) return "";
-  return normalizeExtractedLines(lines.slice(startLine), promptText);
+  return null;
 }
 
-function settleAgentReply(): void {
-  if (!awaitingAgentReply) return;
-
-  const screenText = readAgentTerminalText();
-  if (terminalReplyStillWorking(screenText) && Date.now() - agentReplyStartedAt < 30000) {
-    clearAgentSettleTimer();
-    agentSettleTimer = window.setTimeout(() => {
-      settleAgentReply();
-    }, AGENT_REPLY_RECHECK_MS);
+function trimAgentRpcBuffer(): void {
+  if (agentRpcStdoutBuffer.length <= AGENT_STREAM_BUFFER_LIMIT * 2) return;
+  const lastBrace = agentRpcStdoutBuffer.lastIndexOf("{");
+  if (lastBrace !== -1) {
+    agentRpcStdoutBuffer = agentRpcStdoutBuffer.slice(lastBrace);
     return;
   }
+  agentRpcStdoutBuffer = agentRpcStdoutBuffer.slice(-AGENT_STREAM_BUFFER_LIMIT);
+}
 
-  awaitingAgentReply = false;
-  clearAgentSettleTimer();
-  updateChatControlsState();
+function handleAgentRpcStdout(chunk: string): void {
+  if (!chunk) return;
+  agentRpcStdoutBuffer += chunk.replace(/\r\n/g, "\n");
+  trimAgentRpcBuffer();
 
-  const screenTextReply = extractFinalAgentTextFromScreen(screenText, lastUserPrompt);
-  const { text: finalText, nextCursor } = extractFinalAgentText(
-    agentTranscript,
-    agentExtractCursor,
-    lastUserPrompt,
-  );
-  const resolvedReply = screenTextReply || finalText;
-
-  if (resolvedReply) {
-    appendChatMessage("agent", resolvedReply);
-  } else if (agentTranscript.trim()) {
-    const fallback = agentTranscript
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .slice(-4)
-      .join("\n");
-    if (fallback) appendChatMessage("agent", fallback);
-  }
-
-  agentExtractCursor = nextCursor;
-  lastUserPrompt = "";
-  if (agentSessionStarted) {
-    setStatus("Agent ready.", "success");
+  let packet = findNextAgentRpcPacket(agentRpcStdoutBuffer);
+  while (packet) {
+    agentRpcStdoutBuffer = agentRpcStdoutBuffer.slice(packet.end);
+    handleAgentRpcPayload(packet.payload);
+    packet = findNextAgentRpcPacket(agentRpcStdoutBuffer);
   }
 }
 
-function scheduleAgentSettle(): void {
-  clearAgentSettleTimer();
-  agentSettleTimer = window.setTimeout(() => {
-    settleAgentReply();
-  }, AGENT_REPLY_IDLE_MS);
-}
-
-function beginAgentReply(prompt: string): void {
+function queueAgentPrompt(prompt: string): void {
+  if (!agentRpcProcess || agentRpcProcess.exited) {
+    setStatus("Agent session is not running.", "error");
+    return;
+  }
   awaitingAgentReply = true;
-  agentReplyStartedAt = Date.now();
-  lastUserPrompt = prompt.trim();
-  agentEscapeCarry = "";
-  clearAgentSettleTimer();
+  agentRpcReplyBuffer = "";
+  agentRpcCurrentPromptId = nextAgentRpcId("prompt");
   updateChatControlsState();
   setStatus("Agent is thinking...", "loading");
+  try {
+    sendAgentRpcRequest({
+      id: agentRpcCurrentPromptId,
+      type: "prompt",
+      message: prompt,
+    });
+  } catch (err) {
+    resetAgentStreamState();
+    const message = err instanceof Error ? err.message : String(err);
+    appendChatMessage("system", message);
+    setStatus(message, "error");
+  }
 }
 
-function collectAgentOutput(clean: string): void {
-  if (!agentSessionStarted && !pendingStart) return;
-  if (!clean) return;
-  updateSessionMetaFromChunk(clean);
+async function startAgentRpcSession(config: AgentConfig): Promise<void> {
+  if (!nodepod) throw new Error("Nodepod runtime is not ready.");
 
-  if (!awaitingAgentReply) {
-    return;
-  }
+  stopAgentRpcProcess(false);
+  pendingStart = true;
+  resetAgentStreamState();
+  updateStartButtonState();
+  clearStartWatchdog();
+  setStatus("Starting Agent RPC session...", "loading");
 
-  agentTranscript += clean;
-  if (agentTranscript.length > AGENT_STREAM_BUFFER_LIMIT) {
-    const overflow = agentTranscript.length - AGENT_STREAM_BUFFER_LIMIT;
-    agentTranscript = agentTranscript.slice(overflow);
-    agentExtractCursor = Math.max(0, agentExtractCursor - overflow);
-  }
+  const proc = await nodepod.spawn("node", buildAgentRpcArgs(config), {
+    cwd: "/workspace",
+    env: buildAgentRpcEnv(config),
+  });
+  agentRpcProcess = proc;
 
-  scheduleAgentSettle();
+  proc.on("output", (chunk: string) => {
+    if (agentRpcProcess !== proc) return;
+    handleAgentRpcStdout(chunk);
+  });
+  proc.on("error", (chunk: string) => {
+    if (agentRpcProcess !== proc) return;
+    const message = String(chunk ?? "");
+    if (!message) return;
+    writeAgentTerminalLog(message);
+  });
+  proc.on("exit", (code: number) => {
+    const wasCurrent = agentRpcProcess === proc;
+    const exitedDuringStart = wasCurrent && pendingStart;
+    const exitedDuringReply = wasCurrent && awaitingAgentReply;
+    if (wasCurrent) {
+      stopAgentRpcProcess();
+    }
+    if (exitedDuringStart) {
+      finishStartError(`Agent process exited early (code ${code}).`);
+      return;
+    }
+    if (exitedDuringReply) {
+      appendChatMessage("system", `Agent process exited unexpectedly (code ${code}).`);
+    }
+    if (wasCurrent) {
+      setStatus(`Agent process stopped (exit ${code}).`, code === 0 ? "idle" : "error");
+    }
+  });
+
+  agentRpcStartRequestId = nextAgentRpcId("get-state");
+  startWatchdogTimer = window.setTimeout(() => {
+    if (!pendingStart) return;
+    finishStartError("Agent startup timeout. Retry Start Agent CLI or open terminal.");
+    stopAgentRpcProcess();
+  }, AGENT_RPC_START_TIMEOUT_MS);
+
+  sendAgentRpcRequest({
+    id: agentRpcStartRequestId,
+    type: "get_state",
+  });
 }
 
 function createDoneToken(prefix: string): string {
@@ -765,19 +849,15 @@ function clearStartWatchdog(): void {
 
 function finishStartSuccess(): void {
   pendingStart = false;
-  pendingStartBuffer = "";
   clearStartWatchdog();
   updateStartButtonState();
   agentSessionStarted = true;
   resetAgentStreamState();
   updateChatControlsState();
-  setStatus("Agent CLI started.", "success");
-  appendChatMessage("system", "Agent CLI started. You can chat below.");
 }
 
 function finishStartError(message: string): void {
   pendingStart = false;
-  pendingStartBuffer = "";
   clearStartWatchdog();
   updateStartButtonState();
   agentSessionStarted = false;
@@ -785,52 +865,6 @@ function finishStartError(message: string): void {
   updateChatControlsState();
   setStatus(message, "error");
   appendChatMessage("system", message);
-}
-
-function handleStartTracking(clean: string): void {
-  if (!pendingStart) return;
-
-  pendingStartBuffer += clean;
-  if (pendingStartBuffer.length > 12000) {
-    pendingStartBuffer = pendingStartBuffer.slice(-6000);
-  }
-
-  if (/\bpi v\d+/i.test(pendingStartBuffer)) {
-    finishStartSuccess();
-    return;
-  }
-
-  if (
-    /Error:\s*401|Invalid Authentication|authentication_error|Unknown provider|models\.json error|Connection error/i.test(
-      pendingStartBuffer,
-    )
-  ) {
-    finishStartError("Agent CLI start failed. Check API key/model/baseUrl.");
-  }
-}
-
-function handleWorkflowOutput(clean: string): void {
-  if (!clean) return;
-  handleStartTracking(clean);
-}
-
-function wireTerminalOutputMirror(term: NodepodTerminal): void {
-  const t = term as any;
-  if (t.__chatMirrorPatched) return;
-
-  const originalWriteOutput = t._writeOutput?.bind(t);
-  if (typeof originalWriteOutput === "function") {
-    t._writeOutput = (text: string, isError = false) => {
-      const clean = normalizeAgentChunk(String(text ?? ""));
-      if (clean) {
-        handleWorkflowOutput(clean);
-        collectAgentOutput(clean);
-      }
-      return originalWriteOutput(text, isError);
-    };
-  }
-
-  t.__chatMirrorPatched = true;
 }
 
 function setTerminalVisible(nextVisible: boolean): void {
@@ -899,14 +933,6 @@ function buildInstallCommand(): string {
     "node -e 'const fs=require(\"fs\");const path=\"/home/user/.pi/agent/models.json\";const baseUrl=process.env.PI_BASE_URL||\"https://api.moonshot.cn/v1\";const model=process.env.PI_MODEL_ID||\"kimi-k2-turbo-preview\";const apiKey=process.env.PI_API_KEY||\"PI_API_KEY\";const cfg={providers:{\"custom-openai\":{api:\"openai-completions\",baseUrl,apiKey,authHeader:true,models:[{id:model,name:model,contextWindow:128000,reasoning:false}]}}};fs.writeFileSync(path,JSON.stringify(cfg,null,2));console.log(`models.json written: ${path}`);'",
     "CLI=/home/user/.pi/agent/node_modules/@mariozechner/pi-coding-agent/dist/cli.js",
     "HOME=/home/user node \"$CLI\" --list-models",
-  ].join(" && ");
-}
-
-function buildStartAgentCommand(): string {
-  return [
-    "cd /home/user/.pi/agent",
-    "CLI=/home/user/.pi/agent/node_modules/@mariozechner/pi-coding-agent/dist/cli.js",
-    "HOME=/home/user NODEPOD_NO_INTERACTIVE_TIMEOUT=1 node \"$CLI\" --provider custom-openai --model \"$PI_MODEL_ID\"",
   ].join(" && ");
 }
 
@@ -1158,7 +1184,6 @@ async function bootRuntime(): Promise<void> {
       shareRuntimeCwd: false,
     });
     agentTerminal.attach(agentTerminalEl);
-    wireTerminalOutputMirror(agentTerminal);
     agentTerminal.showPrompt();
 
     workspaceTerminal = nodepod.createTerminal({
@@ -1202,8 +1227,7 @@ function sendAgentPromptFromInput(): void {
   }
 
   appendChatMessage("user", prompt);
-  beginAgentReply(prompt);
-  sendCommand(prompt);
+  queueAgentPrompt(prompt);
   cmdInput.value = "";
 }
 
@@ -1344,7 +1368,7 @@ installBtn.addEventListener("click", async () => {
   appendChatMessage("system", "Installing agent dependencies...");
 });
 
-startAgentBtn.addEventListener("click", () => {
+startAgentBtn.addEventListener("click", async () => {
   if (!appliedConfig) {
     setStatus("Click Apply Agent Env and confirm first.", "idle");
     return;
@@ -1360,19 +1384,14 @@ startAgentBtn.addEventListener("click", () => {
     return;
   }
 
-  pendingStart = true;
-  resetAgentStreamState();
-  updateStartButtonState();
   setActiveTerminal("agent");
-  pendingStartBuffer = "";
-  clearStartWatchdog();
-  startWatchdogTimer = window.setTimeout(() => {
-    if (!pendingStart) return;
-    finishStartError("Agent startup timeout. Retry Start Agent CLI or open terminal.");
-  }, 12000);
-
-  sendCommand(`${buildExportCommand(appliedConfig)} && ${buildStartAgentCommand()}`);
-  setStatus("Starting Agent CLI...", "loading");
+  try {
+    await startAgentRpcSession(appliedConfig);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    finishStartError(message);
+    stopAgentRpcProcess();
+  }
 });
 
 runBtn.addEventListener("click", () => {
@@ -1393,4 +1412,8 @@ clearBtn.addEventListener("click", () => {
   if (!(terminal as any)._running) {
     terminal.showPrompt();
   }
+});
+
+window.addEventListener("beforeunload", () => {
+  stopAgentRpcProcess(false);
 });
