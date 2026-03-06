@@ -233,6 +233,10 @@ button:disabled {
   background: linear-gradient(180deg, rgba(48, 63, 83, 0.96) 0%, rgba(29, 40, 55, 0.96) 100%);
 }
 
+#new-session-btn {
+  background: linear-gradient(180deg, rgba(107, 128, 154, 0.96) 0%, rgba(74, 91, 115, 0.96) 100%);
+}
+
 #clear-btn {
   background: linear-gradient(180deg, rgba(232, 127, 70, 0.95) 0%, rgba(189, 91, 46, 0.95) 100%);
 }

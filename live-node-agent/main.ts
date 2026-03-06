@@ -8,6 +8,7 @@ const sessionMetaEl = document.querySelector("#session-meta") as HTMLSpanElement
 const installBtn = document.querySelector("#install-btn") as HTMLButtonElement;
 const applyEnvBtn = document.querySelector("#apply-env-btn") as HTMLButtonElement;
 const startAgentBtn = document.querySelector("#start-agent-btn") as HTMLButtonElement;
+const newSessionBtn = document.querySelector("#new-session-btn") as HTMLButtonElement;
 const toggleTerminalBtn = document.querySelector("#toggle-terminal-btn") as HTMLButtonElement;
 const runBtn = document.querySelector("#run-btn") as HTMLButtonElement;
 const clearBtn = document.querySelector("#clear-btn") as HTMLButtonElement;
@@ -127,6 +128,7 @@ let installPollStartedAt = 0;
 let pendingStart = false;
 let startWatchdogTimer: number | null = null;
 let awaitingAgentReply = false;
+let pendingSessionReset = false;
 let selectedTreePath: string | null = null;
 let selectedTreeIsDirectory = false;
 let fileTreeRefreshInFlight = false;
@@ -138,8 +140,11 @@ let agentRpcProcess: NodepodProcess | null = null;
 let agentRpcStdoutBuffer = "";
 let agentRpcRequestSeq = 0;
 let agentRpcStartRequestId: string | null = null;
+let agentRpcNewSessionRequestId: string | null = null;
 let agentRpcCurrentPromptId: string | null = null;
 let agentRpcReplyBuffer = "";
+let activeToolMessageEl: HTMLDivElement | null = null;
+let activeRetryMessageEl: HTMLDivElement | null = null;
 const announcedPreviewPorts = new Set<number>();
 const sessionMeta: SessionMeta = {
   cwd: "",
@@ -148,8 +153,10 @@ const sessionMeta: SessionMeta = {
 };
 
 function updateChatControlsState(): void {
-  cmdInput.disabled = !agentSessionStarted;
-  runBtn.disabled = !agentSessionStarted || awaitingAgentReply;
+  const canChat = agentSessionStarted && !pendingSessionReset;
+  cmdInput.disabled = !canChat;
+  runBtn.disabled = !canChat || awaitingAgentReply;
+  newSessionBtn.disabled = !canChat || awaitingAgentReply || pendingStart;
 }
 
 function updateFileActionState(): void {
@@ -305,6 +312,11 @@ function appendChatMessage(role: "system" | "user" | "agent", text: string): HTM
   return message;
 }
 
+function updateChatMessage(message: HTMLDivElement, text: string): void {
+  message.textContent = text;
+  scrollChatToBottom();
+}
+
 function sanitizeUploadName(name: string): string {
   return name.replace(/[\\/]+/g, "-").trim() || "upload.bin";
 }
@@ -392,7 +404,63 @@ function resetAgentStreamState(): void {
   awaitingAgentReply = false;
   agentRpcCurrentPromptId = null;
   agentRpcReplyBuffer = "";
+  activeToolMessageEl = null;
+  activeRetryMessageEl = null;
   updateChatControlsState();
+}
+
+function summarizeToolArgs(args: Record<string, unknown> | undefined): string {
+  if (!args || typeof args !== "object") return "";
+
+  const keys = ["filePath", "path", "newPath", "command", "cmd", "pattern"];
+  for (const key of keys) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim()) {
+      const compact = value.replace(/\s+/g, " ").trim();
+      return compact.length > 72 ? `${compact.slice(0, 69)}...` : compact;
+    }
+  }
+
+  if (Array.isArray(args.paths) && args.paths.length > 0) {
+    const first = args.paths.find((value) => typeof value === "string");
+    if (typeof first === "string") return first;
+  }
+
+  return "";
+}
+
+function setToolActivityMessage(text: string): void {
+  if (!activeToolMessageEl) {
+    activeToolMessageEl = appendChatMessage("system", text);
+    return;
+  }
+  updateChatMessage(activeToolMessageEl, text);
+}
+
+function closeToolActivityMessage(text: string): void {
+  if (!activeToolMessageEl) {
+    appendChatMessage("system", text);
+    return;
+  }
+  updateChatMessage(activeToolMessageEl, text);
+  activeToolMessageEl = null;
+}
+
+function setRetryActivityMessage(text: string): void {
+  if (!activeRetryMessageEl) {
+    activeRetryMessageEl = appendChatMessage("system", text);
+    return;
+  }
+  updateChatMessage(activeRetryMessageEl, text);
+}
+
+function closeRetryActivityMessage(text: string): void {
+  if (!activeRetryMessageEl) {
+    appendChatMessage("system", text);
+    return;
+  }
+  updateChatMessage(activeRetryMessageEl, text);
+  activeRetryMessageEl = null;
 }
 
 function nextAgentRpcId(prefix: string): string {
@@ -412,6 +480,8 @@ function stopAgentRpcProcess(resetSession = true): void {
   agentRpcProcess = null;
   agentRpcStdoutBuffer = "";
   agentRpcStartRequestId = null;
+  agentRpcNewSessionRequestId = null;
+  pendingSessionReset = false;
   resetAgentStreamState();
 
   if (resetSession) {
@@ -420,6 +490,32 @@ function stopAgentRpcProcess(resetSession = true): void {
     sessionMeta.usage = "";
     sessionMeta.model = "";
     renderSessionMeta();
+  }
+}
+
+function beginSessionReset(): void {
+  if (!agentRpcProcess || agentRpcProcess.exited) {
+    setStatus("Agent session is not running.", "error");
+    return;
+  }
+
+  pendingSessionReset = true;
+  updateChatControlsState();
+  setStatus("Starting a fresh agent session...", "loading");
+
+  try {
+    agentRpcNewSessionRequestId = nextAgentRpcId("new-session");
+    sendAgentRpcRequest({
+      id: agentRpcNewSessionRequestId,
+      type: "new_session",
+    });
+  } catch (err) {
+    pendingSessionReset = false;
+    agentRpcNewSessionRequestId = null;
+    updateChatControlsState();
+    const message = err instanceof Error ? err.message : String(err);
+    appendChatMessage("system", message);
+    setStatus(message, "error");
   }
 }
 
@@ -523,25 +619,40 @@ function handleAgentRpcEvent(event: AgentRpcEvent): void {
     case "tool_execution_start":
       if (awaitingAgentReply) {
         const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+        const detail = summarizeToolArgs(event.args);
+        setToolActivityMessage(
+          detail ? `Running ${toolName}: ${detail}` : `Running ${toolName}...`,
+        );
         setStatus(`Running ${toolName}...`, "loading");
       }
       break;
     case "tool_execution_end":
-      if (awaitingAgentReply && event.isError) {
+      if (awaitingAgentReply) {
         const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
-        setStatus(`${toolName} reported an error.`, "error");
+        if (event.isError) {
+          closeToolActivityMessage(`${toolName} reported an error.`);
+          setStatus(`${toolName} reported an error.`, "error");
+        } else {
+          closeToolActivityMessage(`${toolName} completed.`);
+        }
       }
       break;
     case "auto_retry_start":
       if (awaitingAgentReply) {
         const attempt = typeof event.attempt === "number" ? event.attempt : "?";
         const maxAttempts = typeof event.maxAttempts === "number" ? event.maxAttempts : "?";
+        setRetryActivityMessage(`Retrying request (${attempt}/${maxAttempts})...`);
         setStatus(`Retrying agent request (${attempt}/${maxAttempts})...`, "loading");
       }
       break;
     case "auto_retry_end":
-      if (awaitingAgentReply && event.success === false && typeof event.finalError === "string") {
-        setStatus(`Retry failed: ${event.finalError}`, "error");
+      if (awaitingAgentReply) {
+        if (event.success === false && typeof event.finalError === "string") {
+          closeRetryActivityMessage(`Retry failed: ${event.finalError}`);
+          setStatus(`Retry failed: ${event.finalError}`, "error");
+        } else {
+          closeRetryActivityMessage("Retry completed.");
+        }
       }
       break;
     case "extension_ui_request":
@@ -579,6 +690,41 @@ function handleAgentRpcResponse(response: AgentRpcResponse): void {
       finishStartError(message);
     }
     agentRpcStartRequestId = null;
+    return;
+  }
+
+  if (response.id === agentRpcNewSessionRequestId || response.command === "new_session") {
+    pendingSessionReset = false;
+    agentRpcNewSessionRequestId = null;
+    updateChatControlsState();
+
+    if (!response.success) {
+      const message = response.error?.message || "Failed to start a new agent session.";
+      appendChatMessage("system", message);
+      setStatus(message, "error");
+      return;
+    }
+
+    const cancelled =
+      !!response.data &&
+      typeof response.data === "object" &&
+      "cancelled" in response.data &&
+      Boolean((response.data as { cancelled?: unknown }).cancelled);
+
+    if (cancelled) {
+      appendChatMessage("system", "New session request was cancelled.");
+      setStatus("New session was cancelled.", "idle");
+      return;
+    }
+
+    resetAgentStreamState();
+    appendChatMessage("system", "Started a new agent session.");
+    setStatus("New agent session started.", "success");
+    try {
+      sendAgentRpcRequest({ id: nextAgentRpcId("get-state"), type: "get_state" });
+    } catch {
+      /* process exited */
+    }
     return;
   }
 
@@ -1392,6 +1538,17 @@ startAgentBtn.addEventListener("click", async () => {
     finishStartError(message);
     stopAgentRpcProcess();
   }
+});
+
+newSessionBtn.addEventListener("click", () => {
+  if (!agentSessionStarted) {
+    setStatus("Start Agent CLI first.", "idle");
+    return;
+  }
+  if (awaitingAgentReply || pendingSessionReset) {
+    return;
+  }
+  beginSessionReset();
 });
 
 runBtn.addEventListener("click", () => {
