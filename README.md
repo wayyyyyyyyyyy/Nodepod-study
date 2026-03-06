@@ -62,6 +62,43 @@ Important:
 npm run dev:demo
 ```
 
+### LiveNode Agent: Current Capabilities
+
+The current LiveNode Agent implementation is no longer tied to parsing terminal TUI output. It now uses the Pi coding agent in **RPC mode** for the main chat flow.
+
+- **Structured RPC chat** — agent replies, tool activity, retries, and errors are handled as structured events instead of raw terminal text
+- **Dual terminals**
+  - `Agent Terminal` is reserved for install logs and agent RPC debug output
+  - `Workspace Terminal` is for manual commands like `vite`, `npm`, and `git`
+- **App Preview panel** — local servers started inside Nodepod can be previewed in-page
+- **Session controls**
+  - `New Session`
+  - `Stop Session`
+  - `Reconnect`
+  - `Clear Conversation`
+- **Workspace sidebar** — file tree, upload, download, and automatic refresh
+
+### Recommended Local Workflow
+
+For normal use:
+
+1. Click `Install Agent`
+2. Click `Configure Env`
+3. Click `Start CLI`
+4. Chat in the conversation box
+
+For development inside the browser runtime:
+
+1. Open `Workspace Terminal`
+2. Run commands like `npm`, `vite`, or `git`
+3. Use the preview panel for local dev servers
+
+### Notes and Known Limits
+
+- `Reconnect` depends on the installed `@mariozechner/pi-coding-agent` version supporting reopening a session from the returned `sessionFile`
+- `Clear Conversation` only clears the browser chat view; it does **not** erase the actual Pi session history
+- The current fork is verified for **local development usage**; production deployment details are intentionally not covered here
+
 ## Quick Start
 
 ```typescript

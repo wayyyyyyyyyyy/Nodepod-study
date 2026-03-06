@@ -661,6 +661,49 @@ button:disabled {
   color: #19789b;
 }
 
+.chat-message.system[data-structured-card="true"] {
+  padding: 12px 14px;
+}
+
+.chat-message.system[data-structured-card="true"]::before {
+  content: none;
+  display: none;
+}
+
+.system-card-label {
+  margin-bottom: 6px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  opacity: 0.84;
+}
+
+.system-card-title {
+  font-size: 14px;
+  font-weight: 720;
+  line-height: 1.4;
+  color: #183550;
+}
+
+.system-card-meta {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: rgba(43, 75, 106, 0.92);
+  word-break: break-word;
+}
+
+.system-card-body {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(103, 169, 211, 0.2);
+  font-size: 12px;
+  line-height: 1.5;
+  color: rgba(39, 67, 93, 0.92);
+  word-break: break-word;
+}
+
 .chat-message.system[data-system-kind="retry"] {
   background:
     linear-gradient(135deg, rgba(255, 246, 231, 0.99), rgba(255, 250, 241, 0.96)),
@@ -692,6 +735,27 @@ button:disabled {
 .chat-message.system[data-system-kind="error"]::before {
   content: attr(data-system-label);
   color: #b24b3d;
+}
+
+.chat-message.system[data-system-kind="tool"] .system-card-label {
+  color: #19789b;
+}
+
+.chat-message.system[data-system-kind="retry"] .system-card-label {
+  color: #a26812;
+}
+
+.chat-message.system[data-system-kind="error"] .system-card-label {
+  color: #b24b3d;
+}
+
+.chat-message.system[data-system-kind="error"] .system-card-title {
+  color: rgba(88, 33, 28, 0.96);
+}
+
+.chat-message.system[data-system-kind="error"] .system-card-meta,
+.chat-message.system[data-system-kind="error"] .system-card-body {
+  color: rgba(104, 48, 42, 0.9);
 }
 
 .chat-input-row {

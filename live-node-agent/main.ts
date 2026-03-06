@@ -93,6 +93,12 @@ type PreviewTarget = {
 type TerminalKind = "agent" | "workspace";
 type SystemMessageKind = "tool" | "retry" | "error";
 type SystemErrorKind = "auth" | "startup" | "rpc" | "tool" | "extension" | "runtime";
+type StructuredSystemCard = {
+  label: string;
+  title: string;
+  meta?: string;
+  body?: string;
+};
 
 type AgentRpcRequest =
   | { id: string; type: "get_state" | "new_session" }
@@ -357,6 +363,39 @@ function setSystemMessageVariant(
   message.dataset.systemLabel = label;
 }
 
+function renderStructuredSystemCard(message: HTMLDivElement, card: StructuredSystemCard): void {
+  message.dataset.structuredCard = "true";
+  message.dataset.systemLabel = card.label;
+  message.textContent = "";
+
+  const labelEl = document.createElement("div");
+  labelEl.className = "system-card-label";
+  labelEl.textContent = card.label;
+  message.appendChild(labelEl);
+
+  const titleEl = document.createElement("div");
+  titleEl.className = "system-card-title";
+  titleEl.textContent = card.title;
+  message.appendChild(titleEl);
+
+  if (card.meta) {
+    const metaEl = document.createElement("div");
+    metaEl.className = "system-card-meta";
+    metaEl.textContent = card.meta;
+    message.appendChild(metaEl);
+  }
+
+  if (card.body) {
+    const bodyEl = document.createElement("div");
+    bodyEl.className = "system-card-body";
+    bodyEl.textContent = card.body;
+    message.appendChild(bodyEl);
+  }
+
+  scrollChatToBottom();
+  updateChatControlsState();
+}
+
 function appendSystemStatusMessage(
   text: string,
   kind: SystemMessageKind,
@@ -593,6 +632,18 @@ function truncateInlineText(value: string, maxLength = 120): string {
   return `${compact.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
+function splitPrimaryAndDetail(value: string): { primary: string; detail: string } {
+  const compact = truncateInlineText(value, 160);
+  const index = compact.indexOf(". ");
+  if (index === -1) {
+    return { primary: compact, detail: "" };
+  }
+  return {
+    primary: compact.slice(0, index + 1).trim(),
+    detail: compact.slice(index + 2).trim(),
+  };
+}
+
 function getRecordString(value: unknown, keys: string[]): string {
   if (!value || typeof value !== "object") return "";
   const record = value as Record<string, unknown>;
@@ -739,34 +790,147 @@ function formatToolLabel(toolName: string): string {
   return `Tool · ${toolName}`;
 }
 
-function setToolActivityMessage(text: string, toolName = "tool"): void {
+function buildToolStartCard(toolName: string, args?: Record<string, unknown>): StructuredSystemCard {
   const label = formatToolLabel(toolName);
-  if (!activeToolMessageEl) {
-    activeToolMessageEl = appendSystemStatusMessage(text, "tool", label);
-    return;
-  }
-  setSystemMessageVariant(activeToolMessageEl, "tool", label);
-  updateChatMessage(activeToolMessageEl, text);
+  const detail = summarizeToolArgs(args);
+  return {
+    label,
+    title: "Running",
+    meta: detail || `Executing ${toolName} inside the browser runtime.`,
+  };
 }
 
-function closeToolActivityMessage(text: string, toolName = "tool"): void {
+function buildToolSuccessCard(
+  toolName: string,
+  args: Record<string, unknown> | undefined,
+  result: unknown,
+): StructuredSystemCard {
   const label = formatToolLabel(toolName);
+  const normalized = toolName.toLowerCase();
+  const detail = summarizeToolArgs(args);
+  const path =
+    detail || getRecordString(result, ["filePath", "path", "newPath", "targetPath", "outputPath"]);
+
+  if (normalized === "read") {
+    const content = getRecordString(result, ["content", "text", "output"]);
+    return {
+      label,
+      title: "Read completed",
+      meta: path || "Read operation finished.",
+      body: content ? `${countTextLines(content)} lines loaded.` : undefined,
+    };
+  }
+
+  if (normalized === "write") {
+    const content = getRecordString(result, ["content", "text"]);
+    return {
+      label,
+      title: "Write completed",
+      meta: path || "Write operation finished.",
+      body: content ? `${content.length} characters written.` : undefined,
+    };
+  }
+
+  if (normalized === "edit") {
+    const changes =
+      getRecordNumber(result, ["changeCount", "editCount", "replacementCount", "modifiedLineCount"]) ??
+      getRecordArrayLength(result, ["changes", "edits", "replacements"]);
+    return {
+      label,
+      title: "Edit completed",
+      meta: path || "Edit operation finished.",
+      body: typeof changes === "number" ? `${changes} changes applied.` : undefined,
+    };
+  }
+
+  if (normalized === "bash") {
+    const command = detail || getRecordString(result, ["command", "cmd"]);
+    const exitCode = getRecordNumber(result, ["exitCode", "code", "status"]);
+    const excerpt = getRecordString(result, ["stderr", "stdout", "output", "message"]);
+    return {
+      label,
+      title: "Command completed",
+      meta: command || "Shell command finished.",
+      body: [
+        typeof exitCode === "number" ? `exit ${exitCode}` : "",
+        excerpt ? truncateInlineText(excerpt, 120) : "",
+      ]
+        .filter(Boolean)
+        .join(" • "),
+    };
+  }
+
+  if (normalized === "search" || normalized === "find" || normalized === "grep") {
+    const matches =
+      getRecordNumber(result, ["matchCount", "count", "totalMatches"]) ??
+      getRecordArrayLength(result, ["matches", "results", "files"]);
+    return {
+      label,
+      title: "Search completed",
+      meta: detail || `${toolName} finished.`,
+      body: typeof matches === "number" ? `${matches} matches found.` : undefined,
+    };
+  }
+
+  const summary = summarizeToolSuccess(toolName, args, result);
+  const split = splitPrimaryAndDetail(summary);
+  return {
+    label,
+    title: split.primary,
+    meta: detail || undefined,
+    body: split.detail || undefined,
+  };
+}
+
+function buildToolFailureCard(
+  toolName: string,
+  args: Record<string, unknown> | undefined,
+  result: unknown,
+): StructuredSystemCard {
+  const label = formatErrorLabel("tool");
+  const detail = summarizeToolArgs(args);
+  const summary = summarizeToolFailure(toolName, args, result);
+  const split = splitPrimaryAndDetail(summary);
+  return {
+    label,
+    title: split.primary || `${toolName} failed.`,
+    meta: detail || undefined,
+    body: split.detail || undefined,
+  };
+}
+
+function setToolActivityMessage(card: StructuredSystemCard): void {
   if (!activeToolMessageEl) {
-    appendSystemStatusMessage(text, "tool", label);
+    activeToolMessageEl = appendChatMessage("system", "");
+    setSystemMessageVariant(activeToolMessageEl, "tool", card.label);
+    renderStructuredSystemCard(activeToolMessageEl, card);
     return;
   }
-  setSystemMessageVariant(activeToolMessageEl, "tool", label);
-  updateChatMessage(activeToolMessageEl, text);
+  setSystemMessageVariant(activeToolMessageEl, "tool", card.label);
+  renderStructuredSystemCard(activeToolMessageEl, card);
+}
+
+function closeToolActivityMessage(card: StructuredSystemCard): void {
+  if (!activeToolMessageEl) {
+    const message = appendChatMessage("system", "");
+    setSystemMessageVariant(message, "tool", card.label);
+    renderStructuredSystemCard(message, card);
+    return;
+  }
+  setSystemMessageVariant(activeToolMessageEl, "tool", card.label);
+  renderStructuredSystemCard(activeToolMessageEl, card);
   activeToolMessageEl = null;
 }
 
-function closeToolErrorMessage(text: string): void {
+function closeToolErrorMessage(card: StructuredSystemCard): void {
   if (!activeToolMessageEl) {
-    appendErrorMessage(text, "tool");
+    const message = appendChatMessage("system", "");
+    setSystemMessageVariant(message, "error", card.label);
+    renderStructuredSystemCard(message, card);
     return;
   }
-  setSystemMessageVariant(activeToolMessageEl, "error", formatErrorLabel("tool"));
-  updateChatMessage(activeToolMessageEl, text);
+  setSystemMessageVariant(activeToolMessageEl, "error", card.label);
+  renderStructuredSystemCard(activeToolMessageEl, card);
   activeToolMessageEl = null;
 }
 
@@ -954,11 +1118,7 @@ function handleAgentRpcEvent(event: AgentRpcEvent): void {
       if (awaitingAgentReply) {
         const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
         activeToolArgs = event.args ?? null;
-        const detail = summarizeToolArgs(event.args);
-        setToolActivityMessage(
-          detail ? `Running ${toolName}: ${detail}` : `Running ${toolName}...`,
-          toolName,
-        );
+        setToolActivityMessage(buildToolStartCard(toolName, event.args));
         setStatus(`Running ${toolName}...`, "loading");
       }
       break;
@@ -967,12 +1127,11 @@ function handleAgentRpcEvent(event: AgentRpcEvent): void {
         const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
         if (event.isError) {
           const summary = summarizeToolFailure(toolName, activeToolArgs ?? undefined, event.result);
-          closeToolErrorMessage(summary);
+          closeToolErrorMessage(buildToolFailureCard(toolName, activeToolArgs ?? undefined, event.result));
           setStatus(summary, "error");
         } else {
           closeToolActivityMessage(
-            summarizeToolSuccess(toolName, activeToolArgs ?? undefined, event.result),
-            toolName,
+            buildToolSuccessCard(toolName, activeToolArgs ?? undefined, event.result),
           );
         }
         activeToolArgs = null;
